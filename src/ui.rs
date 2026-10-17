@@ -59,19 +59,17 @@ fn confirm(prompt: &str) -> Result<bool> {
     ))
 }
 
-/// Prompts for an instance, or returns the single registered one directly.
+/// Prompts for an instance. The menu is always shown, even when only one
+/// instance is registered, so the target of an action is always explicit.
 fn pick_instance(ctx: &Ctx<'_>) -> Result<String> {
     let names = commands::instance_names(&ctx.config);
-    match names.len() {
-        0 => Err(AppError::instance(
+    if names.is_empty() {
+        return Err(AppError::instance(
             "尚未登记任何实例，请先运行 `mm instance add <名称> --home <路径>`".to_string(),
-        )),
-        1 => Ok(names[0].clone()),
-        _ => {
-            let index = choose("请选择实例", &names)?;
-            Ok(names[index].clone())
-        }
+        ));
     }
+    let index = choose("请选择实例", &names)?;
+    Ok(names[index].clone())
 }
 
 fn print_instances(ctx: &Ctx<'_>) -> Result<()> {
