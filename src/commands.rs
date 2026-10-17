@@ -452,6 +452,27 @@ pub fn bind(
 
     let (settings, ini_path) = ctx.settings_for(&instance)?;
     let client = ctx.client(&instance, &settings, &ini_path);
+
+    // Binding revokes every global privilege. Refuse before touching the server
+    // if the account currently holds any, so an administrative account other
+    // than the known names cannot be silently gutted.
+    let before = client.show_grants(user, host)?;
+    let global: Vec<&String> = before
+        .iter()
+        .filter(|line| sql::grant_line_confers_privileges(line))
+        .filter(|line| sql::schema_from_grant_line(line).is_none())
+        .collect();
+    if !global.is_empty() {
+        return Err(AppError::usage(format!(
+            "refusing to bind `{user}`: the account holds global privileges that binding would revoke:\n  {}",
+            global
+                .iter()
+                .map(|line| line.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        )));
+    }
+
     let plan = sql::bind_sql(database, user, host)?;
     client.run_sql(&plan.statements)?;
 
@@ -563,9 +584,19 @@ pub fn workflow(ctx: &mut Ctx<'_>, instance_name: &str) -> Result<WorkflowOutcom
     let client = ctx.client(&instance, &settings, &ini_path);
     let version = client.detect_version()?;
 
-    let existing_schemas = client.existing_schemas().unwrap_or_default();
+    // Failing to enumerate what already exists would silently disable the
+    // collision check below, so surface it instead of defaulting to empty.
+    let existing_schemas = client.existing_schemas().map_err(|error| {
+        AppError::mysql(format!(
+            "cannot list existing databases on `{instance_name}`: {error}"
+        ))
+    })?;
     let database = unique_name(&existing_schemas, sql::random_database_name)?;
-    let existing_accounts = client.existing_accounts().unwrap_or_default();
+    let existing_accounts = client.existing_accounts().map_err(|error| {
+        AppError::mysql(format!(
+            "cannot list existing accounts on `{instance_name}`: {error}"
+        ))
+    })?;
     let username = unique_name(&existing_accounts, sql::random_user_name)?;
     let password = sql::random_password();
     let host = "localhost".to_string();

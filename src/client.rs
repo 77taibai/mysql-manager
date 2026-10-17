@@ -316,6 +316,18 @@ mod tests {
         assert!(invocation.program.ends_with("mysql.exe"));
         let joined = invocation.args.join(" ");
         assert!(joined.contains("--defaults-file="));
+        // `query()` relies on these to get one bare value per line.
+        assert!(
+            invocation.args.iter().any(|arg| arg == "--batch"),
+            "--batch is required for machine-readable output"
+        );
+        assert!(
+            invocation
+                .args
+                .iter()
+                .any(|arg| arg == "--skip-column-names"),
+            "--skip-column-names is required for machine-readable output"
+        );
         assert!(
             !joined.contains("rootpw"),
             "the root password must never appear on the command line"
@@ -375,6 +387,25 @@ mod tests {
         let error = client.run_sql(&["CREATE USER x".to_string()]).unwrap_err();
         assert!(error.to_string().contains("ERROR 1396"));
         assert_eq!(error.code(), crate::error::EXIT_MYSQL);
+    }
+
+    #[test]
+    fn a_rejected_script_still_reports_the_server_error_not_a_pipe_error() {
+        // The child may close stdin before the whole script is written. The
+        // reported failure must be the server's, never a broken-pipe message.
+        let runner = FakeRunner::new();
+        runner.push_fail(1045, "ERROR 1045 (28000): Access denied for user 'root'");
+        let inst = instance();
+        let ini_path = ini();
+        let cfg = settings();
+        let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
+
+        let error = client
+            .run_sql(&["CREATE USER 'a'@'localhost' IDENTIFIED BY 'pw'".to_string()])
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("ERROR 1045"), "got: {text}");
+        assert!(!text.contains("cannot send SQL"), "got: {text}");
     }
 
     #[test]

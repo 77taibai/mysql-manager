@@ -78,14 +78,20 @@ impl Runner for SystemRunner {
                 AppError::mysql(format!("cannot run {}: {error}", program.display()))
             })?;
 
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| AppError::mysql("cannot open stdin for mysql.exe".to_string()))?
-            .write_all(stdin_data.as_bytes())
-            .map_err(|error| {
-                AppError::mysql(format!("cannot send SQL to {}: {error}", program.display()))
-            })?;
+        // A child that rejects the script early closes the pipe. That is not a
+        // fatal condition: the real diagnosis is in its stderr and exit code, so
+        // a broken pipe must not shadow them.
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(error) = stdin.write_all(stdin_data.as_bytes()) {
+                if error.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(AppError::mysql(format!(
+                        "cannot send SQL to {}: {error}",
+                        program.display()
+                    )));
+                }
+            }
+            // Dropping `stdin` here closes the pipe so the child sees EOF.
+        }
 
         let output = child.wait_with_output().map_err(|error| {
             AppError::mysql(format!("cannot read {} output: {error}", program.display()))
