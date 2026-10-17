@@ -15,11 +15,11 @@ pub const MAX_IDENTIFIER_LEN: usize = 64;
 /// unvalidated.
 pub fn validate_identifier(kind: &str, value: &str) -> Result<()> {
     if value.is_empty() {
-        return Err(AppError::usage(format!("the {kind} name cannot be empty")));
+        return Err(AppError::usage(format!("{kind}名称不能为空")));
     }
     if value.len() > MAX_IDENTIFIER_LEN {
         return Err(AppError::usage(format!(
-            "the {kind} name `{value}` is longer than {MAX_IDENTIFIER_LEN} characters"
+            "{kind}名称 `{value}` 超过 {MAX_IDENTIFIER_LEN} 个字符"
         )));
     }
     if !value
@@ -27,7 +27,7 @@ pub fn validate_identifier(kind: &str, value: &str) -> Result<()> {
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
     {
         return Err(AppError::usage(format!(
-            "the {kind} name `{value}` contains unsupported characters; use letters, digits, `_` or `$`"
+            "{kind}名称 `{value}` 含不支持的字符；只能使用字母、数字、`_` 或 `$`"
         )));
     }
     Ok(())
@@ -45,17 +45,15 @@ pub fn validate_user_name(value: &str) -> Result<()> {
 /// legitimate host or `%` wildcard needs.
 pub fn validate_host(value: &str) -> Result<()> {
     if value.is_empty() {
-        return Err(AppError::usage("the host cannot be empty".to_string()));
+        return Err(AppError::usage("主机不能为空".to_string()));
     }
     if value.len() > 255 {
-        return Err(AppError::usage("the host is too long".to_string()));
+        return Err(AppError::usage("主机过长".to_string()));
     }
     if !value.chars().all(|ch| {
         ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '%' | ':' | '[' | ']')
     }) {
-        return Err(AppError::usage(format!(
-            "the host `{value}` contains unsupported characters"
-        )));
+        return Err(AppError::usage(format!("主机 `{value}` 含不支持的字符")));
     }
     Ok(())
 }
@@ -234,9 +232,7 @@ pub fn create_database_sql(version: ServerVersion, database: &str) -> Result<Sql
 pub fn drop_database_sql(database: &str) -> Result<SqlPlan> {
     validate_schema_name(database)?;
     if is_protected_schema(database) {
-        return Err(AppError::usage(format!(
-            "refusing to drop the system database `{database}`"
-        )));
+        return Err(AppError::usage(format!("拒绝删除系统数据库 `{database}`")));
     }
     Ok(SqlPlan::new(vec![format!(
         "DROP DATABASE {}",
@@ -252,15 +248,13 @@ pub fn bind_sql(database: &str, user: &str, host: &str) -> Result<SqlPlan> {
     validate_host(host)?;
     if is_protected_schema(database) {
         return Err(AppError::usage(format!(
-            "refusing to bind an account to the system database `{database}`"
+            "拒绝把账号绑定到系统数据库 `{database}`"
         )));
     }
     // Binding revokes global privileges, so applying it to an administrative
     // account would lock the server out of its own administration.
     if is_protected_user(user) {
-        return Err(AppError::usage(format!(
-            "refusing to bind the protected account `{user}`"
-        )));
+        return Err(AppError::usage(format!("拒绝绑定受保护的账号 `{user}`")));
     }
     let account = account(user, host);
     let statements = vec![
@@ -281,9 +275,7 @@ pub fn unbind_sql(database: &str, user: &str, host: &str) -> Result<SqlPlan> {
     validate_user_name(user)?;
     validate_host(host)?;
     if is_protected_user(user) {
-        return Err(AppError::usage(format!(
-            "refusing to unbind the protected account `{user}`"
-        )));
+        return Err(AppError::usage(format!("拒绝解绑受保护的账号 `{user}`")));
     }
     Ok(SqlPlan::new(vec![
         format!(

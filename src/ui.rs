@@ -7,11 +7,11 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
     print!("{prompt}");
     io::stdout()
         .flush()
-        .map_err(|error| AppError::general(format!("cannot write to the terminal: {error}")))?;
+        .map_err(|error| AppError::general(format!("无法写入终端：{error}")))?;
     let mut buffer = String::new();
     let read = io::stdin()
         .read_line(&mut buffer)
-        .map_err(|error| AppError::general(format!("cannot read from the terminal: {error}")))?;
+        .map_err(|error| AppError::general(format!("无法读取终端输入：{error}")))?;
     if read == 0 {
         return Ok(None);
     }
@@ -19,7 +19,7 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
 }
 
 fn require_line(prompt: &str) -> Result<String> {
-    read_line(prompt)?.ok_or_else(|| AppError::usage("input ended unexpectedly".to_string()))
+    read_line(prompt)?.ok_or_else(|| AppError::usage("输入意外结束".to_string()))
 }
 
 /// Asks for a non-empty value, repeating until one is supplied.
@@ -29,16 +29,14 @@ fn require_non_empty(prompt: &str) -> Result<String> {
         if !value.trim().is_empty() {
             return Ok(value.trim().to_string());
         }
-        println!("A value is required.");
+        println!("该项不能为空，请重新输入。");
     }
 }
 
 /// Presents a numbered list and returns the chosen index.
 fn choose(prompt: &str, options: &[String]) -> Result<usize> {
     if options.is_empty() {
-        return Err(AppError::usage(
-            "there is nothing to choose from".to_string(),
-        ));
+        return Err(AppError::usage("没有可选项".to_string()));
     }
     loop {
         println!();
@@ -48,7 +46,7 @@ fn choose(prompt: &str, options: &[String]) -> Result<usize> {
         let input = require_line(&format!("{prompt} [1-{}]: ", options.len()))?;
         match input.trim().parse::<usize>() {
             Ok(value) if value >= 1 && value <= options.len() => return Ok(value - 1),
-            _ => println!("Enter a number between 1 and {}.", options.len()),
+            _ => println!("请输入 1 到 {} 之间的数字。", options.len()),
         }
     }
 }
@@ -57,7 +55,7 @@ fn confirm(prompt: &str) -> Result<bool> {
     let input = require_line(&format!("{prompt} [y/N]: "))?;
     Ok(matches!(
         input.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
+        "y" | "yes" | "是"
     ))
 }
 
@@ -66,12 +64,11 @@ fn pick_instance(ctx: &Ctx<'_>) -> Result<String> {
     let names = commands::instance_names(&ctx.config);
     match names.len() {
         0 => Err(AppError::instance(
-            "no instance is registered; run `mm instance add <name> --home <path>` first"
-                .to_string(),
+            "尚未登记任何实例，请先运行 `mm instance add <名称> --home <路径>`".to_string(),
         )),
         1 => Ok(names[0].clone()),
         _ => {
-            let index = choose("Select an instance", &names)?;
+            let index = choose("请选择实例", &names)?;
             Ok(names[index].clone())
         }
     }
@@ -80,14 +77,14 @@ fn pick_instance(ctx: &Ctx<'_>) -> Result<String> {
 fn print_instances(ctx: &Ctx<'_>) -> Result<()> {
     let rows = commands::list_instances(ctx)?;
     if rows.is_empty() {
-        println!("No instances are registered yet.");
-        println!("Add one with: mm instance add <name> --home <path>");
+        println!("尚未登记任何实例。");
+        println!("可用以下命令添加：mm instance add <名称> --home <路径>");
         return Ok(());
     }
     println!();
     println!(
-        "{:<16} {:<10} {:<7} {:<13} DATADIR",
-        "NAME", "VERSION", "PORT", "STATUS"
+        "{:<16} {:<10} {:<7} {:<13} 数据目录",
+        "名称", "版本", "端口", "状态"
     );
     for row in rows {
         println!(
@@ -101,17 +98,17 @@ fn print_instances(ctx: &Ctx<'_>) -> Result<()> {
 pub fn run_menu(ctx: &mut Ctx<'_>) -> Result<()> {
     loop {
         println!();
-        println!("MySQL Manager");
-        println!("  1) List instances");
-        println!("  2) Start an instance");
-        println!("  3) Stop an instance");
-        println!("  4) Create a database");
-        println!("  5) Create a user");
-        println!("  6) Bind a user to a database");
-        println!("  7) One-shot test workflow");
-        println!("  0) Exit");
+        println!("MySQL 管理器");
+        println!("  1) 查看实例列表");
+        println!("  2) 启动实例");
+        println!("  3) 停止实例");
+        println!("  4) 创建数据库");
+        println!("  5) 创建用户");
+        println!("  6) 绑定用户到数据库");
+        println!("  7) 一键测试工作流");
+        println!("  0) 退出");
 
-        let input = match read_line("\nChoice: ")? {
+        let input = match read_line("\n请选择：")? {
             Some(value) => value,
             None => {
                 println!();
@@ -123,34 +120,34 @@ pub fn run_menu(ctx: &mut Ctx<'_>) -> Result<()> {
             "0" | "" => return Ok(()),
             "1" => {
                 if let Err(error) = print_instances(ctx) {
-                    eprintln!("error: {error}");
+                    eprintln!("错误：{error}");
                 }
             }
             "2" => match run_start(ctx) {
                 Ok(message) => println!("{message}"),
-                Err(error) => eprintln!("error: {error}"),
+                Err(error) => eprintln!("错误：{error}"),
             },
             "3" => match run_stop(ctx) {
                 Ok(message) => println!("{message}"),
-                Err(error) => eprintln!("error: {error}"),
+                Err(error) => eprintln!("错误：{error}"),
             },
             "4" => match run_create_database(ctx) {
                 Ok(message) => println!("{message}"),
-                Err(error) => eprintln!("error: {error}"),
+                Err(error) => eprintln!("错误：{error}"),
             },
             "5" => match run_create_user(ctx) {
                 Ok(message) => println!("{message}"),
-                Err(error) => eprintln!("error: {error}"),
+                Err(error) => eprintln!("错误：{error}"),
             },
             "6" => match run_bind(ctx) {
                 Ok(message) => println!("{message}"),
-                Err(error) => eprintln!("error: {error}"),
+                Err(error) => eprintln!("错误：{error}"),
             },
             "7" => match run_workflow(ctx) {
                 Ok(()) => {}
-                Err(error) => eprintln!("error: {error}"),
+                Err(error) => eprintln!("错误：{error}"),
             },
-            other => println!("Unknown choice: {other}"),
+            other => println!("无效的选项：{other}"),
         }
     }
 }
@@ -167,31 +164,31 @@ fn run_stop(ctx: &mut Ctx<'_>) -> Result<String> {
 
 fn run_create_database(ctx: &mut Ctx<'_>) -> Result<String> {
     let name = pick_instance(ctx)?;
-    let database = require_non_empty("Database name: ")?;
+    let database = require_non_empty("数据库名称：")?;
     commands::add_database(ctx, &name, &database)
 }
 
 fn run_create_user(ctx: &mut Ctx<'_>) -> Result<String> {
     let name = pick_instance(ctx)?;
-    let user = require_non_empty("User name: ")?;
+    let user = require_non_empty("用户名：")?;
     let host = {
-        let value = require_line("Host [localhost]: ")?;
+        let value = require_line("主机 [localhost]：")?;
         if value.trim().is_empty() {
             commands::default_host().to_string()
         } else {
             value.trim().to_string()
         }
     };
-    let password = require_non_empty("Password: ")?;
+    let password = require_non_empty("密码：")?;
     commands::add_user(ctx, &name, &user, &host, &password)
 }
 
 fn run_bind(ctx: &mut Ctx<'_>) -> Result<String> {
     let name = pick_instance(ctx)?;
-    let database = require_non_empty("Database to bind: ")?;
-    let user = require_non_empty("User to bind: ")?;
+    let database = require_non_empty("要绑定的数据库：")?;
+    let user = require_non_empty("要绑定的用户：")?;
     let host = {
-        let value = require_line("Host [localhost]: ")?;
+        let value = require_line("主机 [localhost]：")?;
         if value.trim().is_empty() {
             commands::default_host().to_string()
         } else {
@@ -203,26 +200,31 @@ fn run_bind(ctx: &mut Ctx<'_>) -> Result<String> {
 
 fn run_workflow(ctx: &mut Ctx<'_>) -> Result<()> {
     let name = pick_instance(ctx)?;
-    println!("\nPreparing a throwaway database and user on `{name}`...");
+    println!("\n正在为 `{name}` 准备临时数据库和用户……");
     let outcome = commands::workflow(ctx, &name)?;
     if outcome.started {
-        println!("Started `{}` for this run.", outcome.instance);
+        println!("本次运行已启动 `{}`。", outcome.instance);
     }
+    print_workflow_result(&outcome);
+    Ok(())
+}
+
+/// Prints the credentials produced by a workflow run.
+pub fn print_workflow_result(outcome: &commands::WorkflowOutcome) {
     println!();
-    println!("Test workflow completed successfully.");
-    println!("  instance: {} (port {})", outcome.instance, outcome.port);
-    println!("  database: {}", outcome.database);
-    println!("  user:     {}@{}", outcome.username, outcome.host);
-    println!("  password: {}", outcome.password);
+    println!("测试工作流执行成功。");
+    println!("  实例：  {}（端口 {}）", outcome.instance, outcome.port);
+    println!("  数据库：{}", outcome.database);
+    println!("  用户：  {}@{}", outcome.username, outcome.host);
+    println!("  密码：  {}", outcome.password);
     println!();
-    println!("Connect with:");
+    println!("可用以下命令连接：");
     println!(
         "  mysql -h 127.0.0.1 -P {} -u {} -p'{}' {}",
         outcome.port, outcome.username, outcome.password, outcome.database
     );
     println!();
-    println!("These details were saved to the configuration file for later reference.");
-    Ok(())
+    println!("以上信息已保存到配置文件，便于后续查看。");
 }
 
 /// Reads a secret. Echo is not suppressed: doing so reliably on Windows needs
@@ -240,5 +242,5 @@ pub fn pick_instance_for_workflow(ctx: &Ctx<'_>) -> Result<String> {
 }
 
 pub fn ask_drop_confirmation(kind: &str, name: &str) -> Result<bool> {
-    confirm(&format!("Permanently drop the {kind} `{name}`?"))
+    confirm(&format!("确定要永久删除{kind} `{name}` 吗？"))
 }

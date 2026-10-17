@@ -30,7 +30,7 @@ impl<'a> Ctx<'a> {
         let ini_path = instance.my_ini_path();
         if !ini_path.exists() {
             return Err(AppError::instance(format!(
-                "the option file {} does not exist; pass `--my-ini` when registering the instance",
+                "配置文件 {} 不存在；登记实例时请用 `--my-ini` 指定正确的文件",
                 ini_path.display()
             )));
         }
@@ -63,21 +63,21 @@ pub fn add_instance(
 
     if ctx.config.find(name).is_some() {
         return Err(AppError::usage(format!(
-            "instance `{name}` is already registered; remove it first with `mm instance remove {name}`"
+            "实例 `{name}` 已登记；如需重新登记，请先运行 `mm instance remove {name}`"
         )));
     }
 
     let home_path = std::path::PathBuf::from(home);
     if !home_path.is_dir() {
         return Err(AppError::instance(format!(
-            "the installation directory does not exist: {}",
+            "安装目录不存在：{}",
             home_path.display()
         )));
     }
     let mysqld = home_path.join("bin").join("mysqld.exe");
     if !mysqld.is_file() {
         return Err(AppError::instance(format!(
-            "{} is not a MySQL installation: mysqld.exe was not found at {}",
+            "{} 不是有效的 MySQL 安装：未找到 {}",
             home_path.display(),
             mysqld.display()
         )));
@@ -94,7 +94,7 @@ pub fn add_instance(
     let ini_path = instance.my_ini_path();
     if !ini_path.is_file() {
         return Err(AppError::instance(format!(
-            "the option file {} does not exist; pass `--my-ini` to point at the right file",
+            "配置文件 {} 不存在；请用 `--my-ini` 指向正确的文件",
             ini_path.display()
         )));
     }
@@ -115,7 +115,7 @@ pub fn add_instance(
         .map(|value| format!("{}.{}.{}", value.major, value.minor, value.patch))
         .unwrap_or_else(|| "unknown".to_string());
     Ok(format!(
-        "registered instance `{name}`\n  version: {version}\n  datadir: {}\n  port:    {port}\n  my.ini:  {}",
+        "已登记实例 `{name}`\n  版本：  {version}\n  数据目录：{}\n  端口：  {port}\n  配置文件：{}",
         datadir.display(),
         ini_path.display()
     ))
@@ -127,7 +127,7 @@ pub fn remove_instance(ctx: &mut Ctx<'_>, name: &str) -> Result<String> {
         .instances
         .iter()
         .position(|item| item.name == name)
-        .ok_or_else(|| AppError::instance(format!("instance `{name}` is not registered")))?;
+        .ok_or_else(|| AppError::instance(format!("实例 `{name}` 未登记")))?;
 
     let removed_bindings = ctx
         .config
@@ -139,11 +139,10 @@ pub fn remove_instance(ctx: &mut Ctx<'_>, name: &str) -> Result<String> {
     ctx.config.bindings.retain(|item| item.instance != name);
     ctx.save()?;
 
-    let mut message =
-        format!("removed instance `{name}` from the configuration (files were not touched)");
+    let mut message = format!("已从配置中移除实例 `{name}`（未改动任何文件）");
     if removed_bindings > 0 {
         message.push_str(&format!(
-            "\n{removed_bindings} binding record(s) for this instance were removed as well"
+            "\n同时清除了该实例的 {removed_bindings} 条绑定记录"
         ));
     }
     Ok(message)
@@ -166,11 +165,11 @@ pub fn list_instances(ctx: &Ctx<'_>) -> Result<Vec<InstanceRow>> {
                     .client(instance, &settings, &ini_path)
                     .detect_version()
                     .map(|value| format!("{}.{}.{}", value.major, value.minor, value.patch))
-                    .unwrap_or_else(|_| "unknown".to_string());
+                    .unwrap_or_else(|_| "未知".to_string());
                 let status = match ctx.lifecycle().status(instance, &settings, &ini_path) {
-                    Ok(Status::Running) => "Running",
-                    Ok(Status::Stopped) => "Stopped",
-                    Err(_) => "Unknown",
+                    Ok(Status::Running) => "运行中",
+                    Ok(Status::Stopped) => "已停止",
+                    Err(_) => "未知",
                 };
                 (
                     version,
@@ -183,9 +182,9 @@ pub fn list_instances(ctx: &Ctx<'_>) -> Result<Vec<InstanceRow>> {
                 )
             }
             Err(_) => (
-                "unknown".to_string(),
+                "未知".to_string(),
                 "-".to_string(),
-                "Config error".to_string(),
+                "配置错误".to_string(),
                 "-".to_string(),
             ),
         };
@@ -211,7 +210,7 @@ pub fn start_instance(ctx: &mut Ctx<'_>, name: &str) -> Result<String> {
     ctx.save()?;
     let port = settings.require_port(&ini_path)?;
     Ok(format!(
-        "started `{name}` (pid {pid}) on port {port}\n  datadir: {}",
+        "已启动 `{name}`（进程号 {pid}，端口 {port}）\n  数据目录：{}",
         settings.require_datadir(&ini_path)?.display()
     ))
 }
@@ -225,7 +224,7 @@ pub fn stop_instance(ctx: &mut Ctx<'_>, name: &str) -> Result<String> {
         stored.last_pid = None;
     }
     ctx.save()?;
-    Ok(format!("stopped `{name}`"))
+    Ok(format!("已停止 `{name}`"))
 }
 
 pub fn instance_status(ctx: &Ctx<'_>, name: &str) -> Result<String> {
@@ -250,13 +249,11 @@ pub fn login(ctx: &mut Ctx<'_>, name: &str, password: &str) -> Result<String> {
     candidate.root_password = password.to_string();
     let client = ctx.client(&candidate, &settings, &ini_path);
 
-    let mut message = format!("updated the root password for `{name}`");
+    let mut message = format!("已更新 `{name}` 的 root 密码");
     if client.is_reachable() {
-        client.query("SELECT 1").map_err(|error| {
-            AppError::mysql(format!(
-                "the server is running but rejected these credentials: {error}"
-            ))
-        })?;
+        client
+            .query("SELECT 1")
+            .map_err(|error| AppError::mysql(format!("服务正在运行，但拒绝了该凭据：{error}")))?;
         message.push_str("\n  verified against the running server");
     } else {
         message.push_str("\n  the server is not running, so the password was not verified yet");
@@ -274,7 +271,7 @@ fn ensure_running(ctx: &Ctx<'_>, instance: &Instance) -> Result<()> {
     match ctx.lifecycle().status(instance, &settings, &ini_path)? {
         Status::Running => Ok(()),
         Status::Stopped => Err(AppError::mysql(format!(
-            "instance `{}` is not running; start it with `mm start {}`",
+            "实例 `{}` 未在运行；请先执行 `mm start {}`",
             instance.name, instance.name
         ))),
     }
@@ -303,7 +300,7 @@ pub fn add_user(
             .any(|item| item.eq_ignore_ascii_case(&target))
         {
             return Err(AppError::mysql(format!(
-                "user `{target}` already exists on `{instance_name}`"
+                "用户 `{target}` 在 `{instance_name}` 上已存在"
             )));
         }
     }
@@ -311,7 +308,7 @@ pub fn add_user(
     let plan = sql::create_user_sql(version, user, host, password)?;
     client.run_sql(&plan.statements)?;
     Ok(format!(
-        "created user `{user}`@`{host}` on `{instance_name}`"
+        "已在 `{instance_name}` 上创建用户 `{user}`@`{host}`"
     ))
 }
 
@@ -324,9 +321,7 @@ pub fn remove_user(
     sql::validate_user_name(user)?;
     sql::validate_host(host)?;
     if sql::is_protected_user(user) {
-        return Err(AppError::usage(format!(
-            "refusing to drop the protected account `{user}`"
-        )));
+        return Err(AppError::usage(format!("拒绝删除受保护的账号 `{user}`")));
     }
     let instance = ctx.config.require(instance_name)?.clone();
     ensure_running(ctx, &instance)?;
@@ -342,11 +337,9 @@ pub fn remove_user(
     let dropped_bindings = before - ctx.config.bindings.len();
     ctx.save()?;
 
-    let mut message = format!("dropped user `{user}`@`{host}` on `{instance_name}`");
+    let mut message = format!("已删除 `{instance_name}` 上的用户 `{user}`@`{host}`");
     if dropped_bindings > 0 {
-        message.push_str(&format!(
-            "\n{dropped_bindings} binding record(s) were removed as well"
-        ));
+        message.push_str(&format!("\n同时清除了 {dropped_bindings} 条绑定记录"));
     }
     Ok(message)
 }
@@ -370,17 +363,13 @@ pub fn add_database(ctx: &mut Ctx<'_>, instance_name: &str, database: &str) -> R
     let version = client.detect_version()?;
     let plan = sql::create_database_sql(version, database)?;
     client.run_sql(&plan.statements)?;
-    Ok(format!(
-        "created database `{database}` on `{instance_name}`"
-    ))
+    Ok(format!("已在 `{instance_name}` 上创建数据库 `{database}`"))
 }
 
 pub fn remove_database(ctx: &mut Ctx<'_>, instance_name: &str, database: &str) -> Result<String> {
     sql::validate_schema_name(database)?;
     if sql::is_protected_schema(database) {
-        return Err(AppError::usage(format!(
-            "refusing to drop the system database `{database}`"
-        )));
+        return Err(AppError::usage(format!("拒绝删除系统数据库 `{database}`")));
     }
     let instance = ctx.config.require(instance_name)?.clone();
     ensure_running(ctx, &instance)?;
@@ -396,11 +385,9 @@ pub fn remove_database(ctx: &mut Ctx<'_>, instance_name: &str, database: &str) -
     let dropped_bindings = before - ctx.config.bindings.len();
     ctx.save()?;
 
-    let mut message = format!("dropped database `{database}` on `{instance_name}`");
+    let mut message = format!("已删除 `{instance_name}` 上的数据库 `{database}`");
     if dropped_bindings > 0 {
-        message.push_str(&format!(
-            "\n{dropped_bindings} binding record(s) were removed as well"
-        ));
+        message.push_str(&format!("\n同时清除了 {dropped_bindings} 条绑定记录"));
     }
     Ok(message)
 }
@@ -429,12 +416,12 @@ pub fn bind(
     sql::validate_host(host)?;
     if sql::is_protected_schema(database) {
         return Err(AppError::usage(format!(
-            "refusing to bind an account to the system database `{database}`"
+            "拒绝把账号绑定到系统数据库 `{database}`"
         )));
     }
     if sql::is_protected_user(user) {
         return Err(AppError::usage(format!(
-            "refusing to bind the protected account `{user}`; binding revokes its global privileges"
+            "拒绝绑定受保护的账号 `{user}`；绑定会回收其全局权限"
         )));
     }
 
@@ -445,7 +432,7 @@ pub fn bind(
         item.instance == instance_name && item.user == user && item.database != database
     }) {
         return Err(AppError::usage(format!(
-            "user `{user}` is already bound to `{}`; run `mm unbind {instance_name} {user}` first",
+            "用户 `{user}` 已绑定到 `{}`；请先执行 `mm unbind {instance_name} {user}`",
             existing.database
         )));
     }
@@ -464,7 +451,7 @@ pub fn bind(
         .collect();
     if !global.is_empty() {
         return Err(AppError::usage(format!(
-            "refusing to bind `{user}`: the account holds global privileges that binding would revoke:\n  {}",
+            "拒绝绑定 `{user}`：该账号持有全局权限，绑定会将其回收：\n  {}",
             global
                 .iter()
                 .map(|line| line.as_str())
@@ -488,7 +475,7 @@ pub fn bind(
         .collect();
     if !offending.is_empty() {
         return Err(AppError::mysql(format!(
-            "the account `{user}` still holds privileges outside `{database}`:\n  {}",
+            "账号 `{user}` 在 `{database}` 之外仍持有权限：\n  {}",
             offending
                 .iter()
                 .map(|line| line.as_str())
@@ -508,7 +495,7 @@ pub fn bind(
     ctx.save()?;
 
     Ok(format!(
-        "bound `{user}`@`{host}` to `{database}` on `{instance_name}`\n  effective grants:\n    {}",
+        "已将 `{user}`@`{host}` 绑定到 `{instance_name}` 上的 `{database}`\n  实际生效的权限：\n    {}",
         grants.join("\n    ")
     ))
 }
@@ -517,9 +504,7 @@ pub fn unbind(ctx: &mut Ctx<'_>, instance_name: &str, user: &str, host: &str) ->
     sql::validate_user_name(user)?;
     sql::validate_host(host)?;
     if sql::is_protected_user(user) {
-        return Err(AppError::usage(format!(
-            "refusing to unbind the protected account `{user}`"
-        )));
+        return Err(AppError::usage(format!("拒绝解绑受保护的账号 `{user}`")));
     }
     let instance = ctx.config.require(instance_name)?.clone();
 
@@ -530,9 +515,7 @@ pub fn unbind(ctx: &mut Ctx<'_>, instance_name: &str, user: &str, host: &str) ->
         .find(|item| item.instance == instance_name && item.user == user)
         .cloned()
         .ok_or_else(|| {
-            AppError::usage(format!(
-                "user `{user}` has no recorded binding on `{instance_name}`"
-            ))
+            AppError::usage(format!("用户 `{user}` 在 `{instance_name}` 上没有绑定记录"))
         })?;
 
     ensure_running(ctx, &instance)?;
@@ -546,7 +529,7 @@ pub fn unbind(ctx: &mut Ctx<'_>, instance_name: &str, user: &str, host: &str) ->
         .retain(|item| !(item.instance == instance_name && item.user == user));
     ctx.save()?;
     Ok(format!(
-        "unbound `{user}` from `{}` on `{instance_name}`",
+        "已解除 `{user}` 与 `{instance_name}` 上 `{}` 的绑定",
         binding.database
     ))
 }
@@ -648,7 +631,7 @@ fn unique_name(existing: &[String], generator: fn() -> String) -> Result<String>
         }
     }
     Err(AppError::general(
-        "could not generate a unique name after 64 attempts".to_string(),
+        "尝试 64 次后仍无法生成不重复的名称".to_string(),
     ))
 }
 
@@ -695,7 +678,7 @@ mod tests {
         }
         let existing = vec!["db_aaaaaa".to_string()];
         let error = unique_name(&existing, constant).unwrap_err();
-        assert!(error.to_string().contains("unique name"));
+        assert!(error.to_string().contains("不重复的名称"));
     }
 
     #[test]
@@ -711,7 +694,7 @@ mod tests {
         });
         let mut ctx = Ctx::new(config, &runner);
         let error = bind(&mut ctx, "x", "appdb", "root", "localhost").unwrap_err();
-        assert!(error.to_string().contains("protected account"));
+        assert!(error.to_string().contains("受保护的账号"));
     }
 
     #[test]
@@ -719,7 +702,7 @@ mod tests {
         let runner = crate::process::SystemRunner;
         let mut ctx = Ctx::new(Config::default(), &runner);
         let error = unbind(&mut ctx, "x", "root", "localhost").unwrap_err();
-        assert!(error.to_string().contains("protected account"));
+        assert!(error.to_string().contains("受保护的账号"));
     }
 
     #[test]
@@ -767,7 +750,7 @@ mod tests {
         let error =
             add_instance(&mut ctx, "bogus", &dir.display().to_string(), None, None).unwrap_err();
         assert!(
-            error.to_string().contains("not a MySQL installation"),
+            error.to_string().contains("不是有效的 MySQL 安装"),
             "got: {error}"
         );
         assert_eq!(error.code(), crate::error::EXIT_INSTANCE);
@@ -780,7 +763,7 @@ mod tests {
         let mut ctx = Ctx::new(Config::default(), &runner);
         let error =
             add_instance(&mut ctx, "bogus", "C:/definitely/not/mysql", None, None).unwrap_err();
-        assert!(error.to_string().contains("does not exist"));
+        assert!(error.to_string().contains("不存在"));
         assert_eq!(error.code(), crate::error::EXIT_INSTANCE);
     }
 
@@ -797,7 +780,7 @@ mod tests {
         });
         let mut ctx = Ctx::new(config, &runner);
         let error = add_instance(&mut ctx, "dup", "C:/dup", None, None).unwrap_err();
-        assert!(error.to_string().contains("already registered"));
+        assert!(error.to_string().contains("已登记"));
     }
 
     #[test]
@@ -813,7 +796,7 @@ mod tests {
         });
         let mut ctx = Ctx::new(config, &runner);
         let error = remove_database(&mut ctx, "x", "mysql").unwrap_err();
-        assert!(error.to_string().contains("system database"));
+        assert!(error.to_string().contains("系统数据库"));
     }
 
     #[test]
@@ -829,7 +812,7 @@ mod tests {
         });
         let mut ctx = Ctx::new(config, &runner);
         let error = remove_user(&mut ctx, "x", "root", "localhost").unwrap_err();
-        assert!(error.to_string().contains("protected account"));
+        assert!(error.to_string().contains("受保护的账号"));
     }
 
     #[test]
@@ -837,7 +820,7 @@ mod tests {
         let runner = crate::process::SystemRunner;
         let mut ctx = Ctx::new(Config::default(), &runner);
         let error = start_instance(&mut ctx, "ghost").unwrap_err();
-        assert!(error.to_string().contains("not registered"));
+        assert!(error.to_string().contains("未登记"));
     }
 
     #[test]
@@ -858,7 +841,7 @@ mod tests {
         });
         let mut ctx = Ctx::new(config, &runner);
         let message = remove_instance(&mut ctx, "x").unwrap();
-        assert!(message.contains("binding record"));
+        assert!(message.contains("绑定记录"));
         assert!(ctx.config.instances.is_empty());
         assert!(ctx.config.bindings.is_empty());
     }

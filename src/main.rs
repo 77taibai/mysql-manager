@@ -1,6 +1,7 @@
 mod client;
 mod commands;
 mod config;
+mod console;
 mod error;
 mod ini;
 mod lifecycle;
@@ -16,59 +17,78 @@ use process::{Runner, SystemRunner};
 #[command(
     name = "mm",
     version,
-    about = "Manage local MySQL instances: on-demand start/stop, database and user management",
-    long_about = None
+    about = "管理本机 MySQL 实例：按需启停，管理数据库与用户",
+    long_about = None,
+    help_template = "{about-with-newline}\n用法：{usage}\n\n{all-args}{after-help}",
+    subcommand_help_heading = "命令",
+    subcommand_value_name = "命令",
+    disable_help_subcommand = true,
+    disable_help_flag = true,
+    disable_version_flag = true
 )]
 struct Cli {
+    /// 显示帮助信息
+    #[arg(short = 'h', long = "help", action = clap::ArgAction::Help, help_heading = "选项")]
+    help: Option<bool>,
+
+    /// 显示版本信息
+    #[arg(
+        short = 'V',
+        long = "version",
+        action = clap::ArgAction::Version,
+        help_heading = "选项"
+    )]
+    version: Option<bool>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Register, list or remove MySQL installations
+    /// 登记、查看或移除 MySQL 安装
     Instance {
         #[command(subcommand)]
         action: InstanceAction,
     },
-    /// Start an instance in the background
+    /// 在后台启动一个实例
     Start { name: String },
-    /// Stop a running instance
+    /// 停止正在运行的实例
     Stop { name: String },
-    /// Show the status of one or all instances
+    /// 查看一个或全部实例的状态
     Status { name: Option<String> },
-    /// Manage database accounts
+    /// 管理数据库账号
     User {
         #[command(subcommand)]
         action: UserAction,
     },
-    /// Manage databases
+    /// 管理数据库
     Db {
         #[command(subcommand)]
         action: DbAction,
     },
-    /// Bind a user to exactly one database, revoking all other privileges
+    /// 将用户绑定到唯一一个数据库，并回收其它所有权限
     Bind {
         name: String,
         database: String,
         user: String,
-        /// Account host, defaults to localhost
+        /// 账号主机，默认为 localhost
         #[arg(long)]
         host: Option<String>,
     },
-    /// Remove a binding
+    /// 解除绑定
     Unbind {
         name: String,
         user: String,
         #[arg(long)]
         host: Option<String>,
     },
-    /// Run the one-shot test workflow
+    /// 执行一键测试工作流
     Workflow { name: Option<String> },
-    /// Set or update the root password for an instance
+    /// 设置或更新某个实例的 root 密码
     Login {
         name: String,
-        /// The root password; prompted for when omitted
+        /// root 密码；省略时交互输入
         #[arg(long)]
         password: Option<String>,
     },
@@ -76,22 +96,22 @@ enum Command {
 
 #[derive(Subcommand)]
 enum InstanceAction {
-    /// Register an installation directory
+    /// 登记一个安装目录
     Add {
         name: String,
-        /// Installation root, the directory containing bin/mysqld.exe
+        /// 安装根目录，即包含 bin/mysqld.exe 的目录
         #[arg(long)]
         home: String,
-        /// Option file, defaults to <home>/my.ini
+        /// 配置文件，默认为 <home>/my.ini
         #[arg(long = "my-ini")]
         my_ini: Option<String>,
-        /// Root password for this instance
+        /// 该实例的 root 密码
         #[arg(long = "root-password")]
         root_password: Option<String>,
     },
-    /// List registered instances
+    /// 列出已登记的实例
     List,
-    /// Remove an instance from the configuration, without touching its files
+    /// 从配置中移除实例，不改动其文件
     Remove { name: String },
 }
 
@@ -110,7 +130,7 @@ enum UserAction {
         user: String,
         #[arg(long)]
         host: Option<String>,
-        /// Skip the confirmation prompt
+        /// 跳过确认提示
         #[arg(long)]
         yes: bool,
     },
@@ -128,7 +148,7 @@ enum DbAction {
     Remove {
         name: String,
         database: String,
-        /// Skip the confirmation prompt
+        /// 跳过确认提示
         #[arg(long)]
         yes: bool,
     },
@@ -138,14 +158,33 @@ enum DbAction {
 }
 
 fn main() {
+    console::use_utf8();
     let cli = Cli::parse();
     let runner = SystemRunner;
     match run(cli, &runner) {
         Ok(()) => {}
         Err(error) => {
-            eprintln!("error: {error}");
+            eprintln!("错误：{error}");
             std::process::exit(error.code());
         }
+    }
+}
+
+fn print_instance_table(rows: &[commands::InstanceRow]) {
+    if rows.is_empty() {
+        println!("尚未登记任何实例。");
+        println!("可用以下命令添加：mm instance add <名称> --home <路径>");
+        return;
+    }
+    println!(
+        "{:<16} {:<10} {:<7} {:<13} 数据目录",
+        "名称", "版本", "端口", "状态"
+    );
+    for row in rows {
+        println!(
+            "{:<16} {:<10} {:<7} {:<13} {}",
+            row.name, row.version, row.port, row.status, row.datadir
+        );
     }
 }
 
@@ -176,21 +215,7 @@ fn run(cli: Cli, runner: &dyn Runner) -> Result<()> {
             ),
             InstanceAction::List => {
                 let rows = commands::list_instances(&ctx)?;
-                if rows.is_empty() {
-                    println!("No instances are registered yet.");
-                    println!("Add one with: mm instance add <name> --home <path>");
-                } else {
-                    println!(
-                        "{:<16} {:<10} {:<7} {:<13} DATADIR",
-                        "NAME", "VERSION", "PORT", "STATUS"
-                    );
-                    for row in rows {
-                        println!(
-                            "{:<16} {:<10} {:<7} {:<13} {}",
-                            row.name, row.version, row.port, row.status, row.datadir
-                        );
-                    }
-                }
+                print_instance_table(&rows);
             }
             InstanceAction::Remove { name } => {
                 println!("{}", commands::remove_instance(&mut ctx, &name)?)
@@ -203,10 +228,10 @@ fn run(cli: Cli, runner: &dyn Runner) -> Result<()> {
             None => {
                 let rows = commands::list_instances(&ctx)?;
                 if rows.is_empty() {
-                    println!("No instances are registered yet.");
+                    println!("尚未登记任何实例。");
                 } else {
                     for row in rows {
-                        println!("{}: {} (port {})", row.name, row.status, row.port);
+                        println!("{}：{}（端口 {}）", row.name, row.status, row.port);
                     }
                 }
             }
@@ -231,8 +256,8 @@ fn run(cli: Cli, runner: &dyn Runner) -> Result<()> {
                 yes,
             } => {
                 let host = host.unwrap_or_else(|| commands::default_host().to_string());
-                if !yes && !ui::ask_drop_confirmation("user", &format!("{user}@{host}"))? {
-                    println!("Cancelled.");
+                if !yes && !ui::ask_drop_confirmation("用户", &format!("{user}@{host}"))? {
+                    println!("已取消。");
                     return Ok(());
                 }
                 println!("{}", commands::remove_user(&mut ctx, &name, &user, &host)?)
@@ -252,8 +277,8 @@ fn run(cli: Cli, runner: &dyn Runner) -> Result<()> {
                 database,
                 yes,
             } => {
-                if !yes && !ui::ask_drop_confirmation("database", &database)? {
-                    println!("Cancelled.");
+                if !yes && !ui::ask_drop_confirmation("数据库", &database)? {
+                    println!("已取消。");
                     return Ok(());
                 }
                 println!("{}", commands::remove_database(&mut ctx, &name, &database)?)
@@ -287,23 +312,14 @@ fn run(cli: Cli, runner: &dyn Runner) -> Result<()> {
             };
             let outcome = commands::workflow(&mut ctx, &name)?;
             if outcome.started {
-                println!("Started `{}` for this run.", outcome.instance);
+                println!("本次运行已启动 `{}`。", outcome.instance);
             }
-            println!("Test workflow completed successfully.");
-            println!("  instance: {} (port {})", outcome.instance, outcome.port);
-            println!("  database: {}", outcome.database);
-            println!("  user:     {}@{}", outcome.username, outcome.host);
-            println!("  password: {}", outcome.password);
-            println!(
-                "\nConnect with:\n  mysql -h 127.0.0.1 -P {} -u {} -p'{}' {}",
-                outcome.port, outcome.username, outcome.password, outcome.database
-            );
-            println!("\nThese details were saved to the configuration file for later reference.");
+            ui::print_workflow_result(&outcome);
         }
         Command::Login { name, password } => {
             let password = match password {
                 Some(value) => value,
-                None => ui::ask_password("Root password: ")?,
+                None => ui::ask_password("root 密码：")?,
             };
             println!("{}", commands::login(&mut ctx, &name, &password)?)
         }

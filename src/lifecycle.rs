@@ -14,8 +14,8 @@ pub enum Status {
 impl Status {
     pub fn label(&self) -> &'static str {
         match self {
-            Status::Running => "Running",
-            Status::Stopped => "Stopped",
+            Status::Running => "运行中",
+            Status::Stopped => "已停止",
         }
     }
 }
@@ -85,7 +85,7 @@ impl<'a> Lifecycle<'a> {
         let client = self.client(instance, settings, ini);
         if client.is_reachable() {
             return Err(AppError::mysql(format!(
-                "instance `{}` is already running on port {}",
+                "实例 `{}` 已在端口 {} 上运行",
                 instance.name,
                 client.port()?
             )));
@@ -93,15 +93,12 @@ impl<'a> Lifecycle<'a> {
 
         let mysqld = instance.mysqld_exe();
         if !self.runner.exists(&mysqld) {
-            return Err(AppError::instance(format!(
-                "mysqld.exe was not found at {}",
-                mysqld.display()
-            )));
+            return Err(AppError::instance(format!("未找到 {}", mysqld.display())));
         }
         let datadir = settings.require_datadir(ini)?;
         if !datadir.exists() {
             return Err(AppError::instance(format!(
-                "the datadir configured in {} does not exist: {}",
+                "{} 中配置的数据目录不存在：{}",
                 ini.display(),
                 datadir.display()
             )));
@@ -116,7 +113,7 @@ impl<'a> Lifecycle<'a> {
             }
             if !process::process_is_alive(self.runner, pid, "mysqld.exe") {
                 return Err(AppError::mysql(format!(
-                    "mysqld exited during startup; check the error log at {}",
+                    "mysqld 在启动过程中退出；请查看错误日志 {}",
                     error_log_hint(&datadir).display()
                 )));
             }
@@ -126,7 +123,7 @@ impl<'a> Lifecycle<'a> {
         // Startup timed out: do not leave an unresponsive server behind.
         process::force_kill(self.runner, pid);
         Err(AppError::mysql(format!(
-            "instance `{}` did not become ready within {} seconds; check the error log at {}",
+            "实例 `{}` 在 {} 秒内未就绪；请查看错误日志 {}",
             instance.name,
             (self.ready_attempts as f32 * self.poll_interval_secs) as u32,
             error_log_hint(&datadir).display()
@@ -147,7 +144,7 @@ impl<'a> Lifecycle<'a> {
 
         if !reachable && !pid_live {
             return Err(AppError::mysql(format!(
-                "instance `{}` is not running",
+                "实例 `{}` 未在运行",
                 instance.name
             )));
         }
@@ -174,7 +171,7 @@ impl<'a> Lifecycle<'a> {
                 // pretending the server stopped, and leave `last_pid` intact so
                 // the operator can still find the process.
                 return Err(AppError::mysql(format!(
-                    "instance `{}` is still running as pid {pid}, which could not be terminated",
+                    "实例 `{}` 仍以进程号 {pid} 运行，且无法终止该进程",
                     instance.name
                 )));
             }
@@ -185,7 +182,7 @@ impl<'a> Lifecycle<'a> {
         }
 
         Err(AppError::mysql(format!(
-            "instance `{}` could not be stopped; the server may still be shutting down",
+            "实例 `{}` 无法停止；服务可能仍在关闭中",
             instance.name
         )))
     }
@@ -288,7 +285,7 @@ mod tests {
         let error = lifecycle
             .start(&instance(None), &settings(), &ini())
             .unwrap_err();
-        assert!(error.to_string().contains("did not become ready"));
+        assert!(error.to_string().contains("未就绪"));
         assert!(
             runner
                 .invocations()
@@ -306,7 +303,7 @@ mod tests {
         let error = lifecycle
             .start(&instance(None), &settings(), &ini())
             .unwrap_err();
-        assert!(error.to_string().contains("already running"));
+        assert!(error.to_string().contains("已在端口"));
     }
 
     #[test]
@@ -318,7 +315,7 @@ mod tests {
         let error = lifecycle
             .start(&instance(None), &settings(), &ini())
             .unwrap_err();
-        assert!(error.to_string().contains("mysqld.exe was not found"));
+        assert!(error.to_string().contains("未找到"));
         assert_eq!(error.code(), crate::error::EXIT_INSTANCE);
     }
 
@@ -335,7 +332,7 @@ mod tests {
         let error = lifecycle
             .start(&instance(None), &missing, &ini())
             .unwrap_err();
-        assert!(error.to_string().contains("does not exist"));
+        assert!(error.to_string().contains("不存在"));
     }
 
     #[test]
@@ -346,7 +343,7 @@ mod tests {
         let error = lifecycle
             .stop(&instance(None), &settings(), &ini())
             .unwrap_err();
-        assert!(error.to_string().contains("is not running"));
+        assert!(error.to_string().contains("未在运行"));
     }
 
     #[test]
@@ -363,7 +360,7 @@ mod tests {
         let error = lifecycle
             .stop(&instance(Some(777)), &settings(), &ini())
             .unwrap_err();
-        assert!(error.to_string().contains("could not be stopped"));
+        assert!(error.to_string().contains("无法停止"));
         // No taskkill may have been attempted.
         assert!(
             !runner
@@ -385,7 +382,7 @@ mod tests {
             .stop(&instance(Some(777)), &settings(), &ini())
             .unwrap_err();
         assert!(
-            error.to_string().contains("could not be terminated"),
+            error.to_string().contains("无法终止"),
             "a refused kill must not be reported as success: {error}"
         );
     }
@@ -413,7 +410,7 @@ mod tests {
         let error = lifecycle
             .stop(&instance(Some(777)), &settings(), &ini())
             .unwrap_err();
-        assert!(error.to_string().contains("is not running"));
+        assert!(error.to_string().contains("未在运行"));
     }
 
     #[test]

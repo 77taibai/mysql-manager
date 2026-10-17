@@ -26,9 +26,8 @@ impl CredentialFile {
             "[client]\nuser={user}\npassword=\"{}\"\nhost={host}\nport={port}\n",
             escape_option_value(password)
         );
-        std::fs::write(&path, content).map_err(|error| {
-            AppError::general(format!("cannot create {}: {error}", path.display()))
-        })?;
+        std::fs::write(&path, content)
+            .map_err(|error| AppError::general(format!("无法创建 {}：{error}", path.display())))?;
         Ok(Self { path })
     }
 
@@ -87,10 +86,7 @@ impl<'a> MysqlClient<'a> {
         args.extend_from_slice(extra);
         let program = self.instance.mysql_exe();
         if !self.runner.exists(&program) {
-            return Err(AppError::instance(format!(
-                "mysql.exe was not found at {}",
-                program.display()
-            )));
+            return Err(AppError::instance(format!("未找到 {}", program.display())));
         }
         // `credentials` is dropped at the end of this scope, deleting the file.
         self.runner.run(&program, &args)
@@ -115,16 +111,13 @@ impl<'a> MysqlClient<'a> {
         ];
         let program = self.instance.mysql_exe();
         if !self.runner.exists(&program) {
-            return Err(AppError::instance(format!(
-                "mysql.exe was not found at {}",
-                program.display()
-            )));
+            return Err(AppError::instance(format!("未找到 {}", program.display())));
         }
         let output = self.runner.run_with_stdin(&program, &args, &script)?;
         if !output.success {
             let detail = output.combined();
             return Err(AppError::mysql(if detail.is_empty() {
-                format!("mysql.exe exited with status {:?}", output.code)
+                format!("mysql.exe 退出状态：{:?}", output.code)
             } else {
                 detail
             }));
@@ -200,7 +193,7 @@ impl<'a> MysqlClient<'a> {
             Ok(())
         } else {
             Err(AppError::mysql(format!(
-                "the new account `{user}` could not connect to `{database}`: {}",
+                "新账号 `{user}` 无法连接到 `{database}`：{}",
                 output.combined()
             )))
         }
@@ -220,10 +213,7 @@ impl<'a> MysqlClient<'a> {
     pub fn detect_version(&self) -> Result<ServerVersion> {
         let program = self.instance.mysqld_exe();
         if !self.runner.exists(&program) {
-            return Err(AppError::instance(format!(
-                "mysqld.exe was not found at {}",
-                program.display()
-            )));
+            return Err(AppError::instance(format!("未找到 {}", program.display())));
         }
         let args = vec!["--version".to_string()];
         let output = self.runner.run(&program, &args)?;
@@ -234,7 +224,7 @@ impl<'a> MysqlClient<'a> {
         };
         ServerVersion::parse(&text).ok_or_else(|| {
             AppError::instance(format!(
-                "cannot determine the MySQL version from `{}` output: {}",
+                "无法从 `{}` 的输出中判断 MySQL 版本：{}",
                 program.display(),
                 text.trim()
             ))
@@ -475,9 +465,7 @@ mod tests {
         let cfg = settings();
         let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
         let error = client.detect_version().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("cannot determine the MySQL version"));
+        assert!(error.to_string().contains("无法从"));
     }
 
     #[test]
@@ -489,7 +477,7 @@ mod tests {
         let cfg = settings();
         let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
         let error = client.verify_account("u_x", "pw", "db_x").unwrap_err();
-        assert!(error.to_string().contains("could not connect"));
+        assert!(error.to_string().contains("无法连接到"));
         assert!(error.to_string().contains("ERROR 1045"));
     }
 }

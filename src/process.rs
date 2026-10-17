@@ -50,9 +50,10 @@ pub struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, program: &Path, args: &[String]) -> Result<CommandOutput> {
-        let output = Command::new(program).args(args).output().map_err(|error| {
-            AppError::mysql(format!("cannot run {}: {error}", program.display()))
-        })?;
+        let output = Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|error| AppError::mysql(format!("无法运行 {}：{error}", program.display())))?;
         Ok(CommandOutput {
             success: output.status.success(),
             code: output.status.code(),
@@ -74,9 +75,7 @@ impl Runner for SystemRunner {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|error| {
-                AppError::mysql(format!("cannot run {}: {error}", program.display()))
-            })?;
+            .map_err(|error| AppError::mysql(format!("无法运行 {}：{error}", program.display())))?;
 
         // A child that rejects the script early closes the pipe. That is not a
         // fatal condition: the real diagnosis is in its stderr and exit code, so
@@ -94,7 +93,7 @@ impl Runner for SystemRunner {
         }
 
         let output = child.wait_with_output().map_err(|error| {
-            AppError::mysql(format!("cannot read {} output: {error}", program.display()))
+            AppError::mysql(format!("无法读取 {} 的输出：{error}", program.display()))
         })?;
         Ok(CommandOutput {
             success: output.status.success(),
@@ -139,7 +138,7 @@ fn spawn_detached(program: &Path, args: &[String]) -> Result<u32> {
 
     let child = command
         .spawn()
-        .map_err(|error| AppError::mysql(format!("cannot start {}: {error}", program.display())))?;
+        .map_err(|error| AppError::mysql(format!("无法启动 {}：{error}", program.display())))?;
     Ok(child.id())
 }
 

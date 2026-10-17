@@ -84,7 +84,7 @@ impl Config {
     pub fn require(&self, name: &str) -> Result<&Instance> {
         self.find(name).ok_or_else(|| {
             AppError::instance(format!(
-                "instance `{name}` is not registered; run `mm instance add {name} --home <path>`"
+                "实例 `{name}` 未登记；请运行 `mm instance add {name} --home <路径>`"
             ))
         })
     }
@@ -94,10 +94,10 @@ impl Config {
 /// working directory, so `cargo run` and a direct launch agree.
 pub fn config_path() -> Result<PathBuf> {
     let exe = std::env::current_exe()
-        .map_err(|error| AppError::general(format!("cannot locate the executable: {error}")))?;
-    let dir = exe.parent().ok_or_else(|| {
-        AppError::general("the executable path has no parent directory".to_string())
-    })?;
+        .map_err(|error| AppError::general(format!("无法定位可执行文件：{error}")))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| AppError::general("可执行文件路径没有上级目录".to_string()))?;
     Ok(dir.join(CONFIG_FILE_NAME))
 }
 
@@ -106,31 +106,30 @@ pub fn load_from(path: &Path) -> Result<Config> {
         return Ok(Config::default());
     }
     let text = std::fs::read_to_string(path)
-        .map_err(|error| AppError::general(format!("cannot read {}: {error}", path.display())))?;
+        .map_err(|error| AppError::general(format!("无法读取 {}：{error}", path.display())))?;
     if text.trim().is_empty() {
         return Ok(Config::default());
     }
     toml::from_str(&text)
-        .map_err(|error| AppError::general(format!("cannot parse {}: {error}", path.display())))
+        .map_err(|error| AppError::general(format!("无法解析 {}：{error}", path.display())))
 }
 
 pub fn save_to(path: &Path, config: &Config) -> Result<()> {
-    let text = toml::to_string_pretty(config).map_err(|error| {
-        AppError::general(format!("cannot serialize the configuration: {error}"))
-    })?;
+    let text = toml::to_string_pretty(config)
+        .map_err(|error| AppError::general(format!("无法序列化配置：{error}")))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
-            AppError::general(format!("cannot create {}: {error}", parent.display()))
+            AppError::general(format!("无法创建 {}：{error}", parent.display()))
         })?;
     }
     // Write to a sibling temporary file first so a crash cannot leave a
     // half-written configuration behind.
     let temp = path.with_extension("toml.tmp");
     std::fs::write(&temp, text)
-        .map_err(|error| AppError::general(format!("cannot write {}: {error}", temp.display())))?;
+        .map_err(|error| AppError::general(format!("无法写入 {}：{error}", temp.display())))?;
     std::fs::rename(&temp, path).map_err(|error| {
         let _ = std::fs::remove_file(&temp);
-        AppError::general(format!("cannot replace {}: {error}", path.display()))
+        AppError::general(format!("无法替换 {}：{error}", path.display()))
     })
 }
 

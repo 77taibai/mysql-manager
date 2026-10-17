@@ -14,7 +14,7 @@ impl MysqldSettings {
         match &self.datadir {
             Some(value) => Ok(PathBuf::from(value)),
             None => Err(AppError::instance(format!(
-                "`datadir` is missing from the [mysqld] section of {}",
+                "[mysqld] 段中缺少 `datadir`：{}",
                 ini.display()
             ))),
         }
@@ -24,7 +24,7 @@ impl MysqldSettings {
         match self.port {
             Some(port) => Ok(port),
             None => Err(AppError::instance(format!(
-                "`port` is missing from the [mysqld] section of {}",
+                "[mysqld] 段中缺少 `port`：{}",
                 ini.display()
             ))),
         }
@@ -102,7 +102,7 @@ pub fn parse_mysqld(content: &str) -> MysqldSettings {
 
 pub fn load(ini: &Path) -> Result<MysqldSettings> {
     let content = std::fs::read_to_string(ini)
-        .map_err(|error| AppError::instance(format!("cannot read {}: {error}", ini.display())))?;
+        .map_err(|error| AppError::instance(format!("无法读取 {}：{error}", ini.display())))?;
     Ok(parse_mysqld(&content))
 }
 
