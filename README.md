@@ -48,10 +48,15 @@ mm db remove mysql56 appdb --yes
 mm user remove mysql56 appuser --yes
 
 mm workflow               # 交互式一键测试
+mm workflows list         # 查看全部 workflow 记录（含密码）
+mm workflows show 2       # 查看第 2 条记录
+mm workflows remove 2     # 删除记录，同时删除它的数据库与用户
 mm                        # 交互式菜单
 ```
 
 `mm workflow` 会选一个实例、必要时启动它、随机生成数据库/用户/密码、完成绑定、验证新账号确实能连上，然后打印连接信息并写入 `config.toml`。
+
+**每次运行都会追加一条记录，不会覆盖历史。** 所以先前运行生成的密码随时可以用 `mm workflows list` 或 `mm workflows show <序号>` 找回。`mm workflows remove <序号>` 会同时删除对应的真实数据库和用户；如果它们已被手工删除，也视为成功并清除记录。
 
 ## 设计说明
 

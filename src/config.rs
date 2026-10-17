@@ -60,6 +60,12 @@ pub struct WorkflowRecord {
     pub username: String,
     #[serde(default)]
     pub password: String,
+    #[serde(default = "default_host_value")]
+    pub host: String,
+}
+
+fn default_host_value() -> String {
+    "localhost".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -68,6 +74,14 @@ pub struct Config {
     pub instances: Vec<Instance>,
     #[serde(default)]
     pub bindings: Vec<Binding>,
+    /// Every workflow run is appended here so an earlier run's generated
+    /// password stays retrievable. `Vec` rather than a single record on
+    /// purpose: overwriting would silently destroy credentials the user still
+    /// needs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<WorkflowRecord>,
+    /// Legacy single-record field from earlier versions. Read only, so an
+    /// existing `config.toml` keeps its last workflow after upgrading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowRecord>,
 }
@@ -87,6 +101,30 @@ impl Config {
                 "实例 `{name}` 未登记；请运行 `mm instance add {name} --home <路径>`"
             ))
         })
+    }
+
+    /// Folds a legacy single `workflow` record into the list so it stays
+    /// visible after upgrading, then clears the legacy field.
+    pub fn migrate_legacy_workflow(&mut self) {
+        if let Some(legacy) = self.workflow.take() {
+            self.workflows.push(legacy);
+        }
+    }
+
+    /// Returns the workflow history, oldest first.
+    pub fn workflow_history(&self) -> &[WorkflowRecord] {
+        &self.workflows
+    }
+
+    /// Resolves a 1-based index typed by the user into a record position.
+    pub fn workflow_index(&self, one_based: usize) -> Result<usize> {
+        if one_based == 0 || one_based > self.workflows.len() {
+            return Err(AppError::usage(format!(
+                "序号 {one_based} 超出范围；当前共 {} 条 workflow 记录",
+                self.workflows.len()
+            )));
+        }
+        Ok(one_based - 1)
     }
 }
 
@@ -110,8 +148,10 @@ pub fn load_from(path: &Path) -> Result<Config> {
     if text.trim().is_empty() {
         return Ok(Config::default());
     }
-    toml::from_str(&text)
-        .map_err(|error| AppError::general(format!("无法解析 {}：{error}", path.display())))
+    let mut config: Config = toml::from_str(&text)
+        .map_err(|error| AppError::general(format!("无法解析 {}：{error}", path.display())))?;
+    config.migrate_legacy_workflow();
+    Ok(config)
 }
 
 pub fn save_to(path: &Path, config: &Config) -> Result<()> {
@@ -159,13 +199,15 @@ mod tests {
                 database: "app".to_string(),
                 user: "app_user".to_string(),
             }],
-            workflow: Some(WorkflowRecord {
+            workflows: vec![WorkflowRecord {
                 last_run: "2026-02-14T10:00:00+08:00".to_string(),
                 instance: "mysql56".to_string(),
                 database: "db_abc123".to_string(),
                 username: "u_abc123".to_string(),
                 password: "pw".to_string(),
-            }),
+                host: "localhost".to_string(),
+            }],
+            workflow: None,
         }
     }
 
@@ -184,7 +226,9 @@ mod tests {
         assert_eq!(loaded.instances[0].root_password, "s3cret");
         assert_eq!(loaded.instances[0].last_pid, Some(4321));
         assert_eq!(loaded.bindings.len(), 1);
-        assert_eq!(loaded.workflow.as_ref().unwrap().database, "db_abc123");
+        assert_eq!(loaded.workflows.len(), 1);
+        assert_eq!(loaded.workflows[0].database, "db_abc123");
+        assert_eq!(loaded.workflows[0].password, "pw");
 
         // No temporary file may survive a successful save.
         assert!(!path.with_extension("toml.tmp").exists());
@@ -198,7 +242,72 @@ mod tests {
         let config = load_from(&path).unwrap();
         assert!(config.instances.is_empty());
         assert!(config.bindings.is_empty());
+        assert!(config.workflows.is_empty());
         assert!(config.workflow.is_none());
+    }
+
+    #[test]
+    fn workflow_history_keeps_every_run() {
+        let dir = std::env::temp_dir().join(format!("mm-wfhist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let mut config = Config::default();
+        for (database, password) in [("db_first", "pw-one"), ("db_second", "pw-two")] {
+            config.workflows.push(WorkflowRecord {
+                last_run: "unix:1".to_string(),
+                instance: "mysql56".to_string(),
+                database: database.to_string(),
+                username: format!("u_{database}"),
+                password: password.to_string(),
+                host: "localhost".to_string(),
+            });
+        }
+        save_to(&path, &config).unwrap();
+
+        let loaded = load_from(&path).unwrap();
+        // The earlier run's password must still be present.
+        assert_eq!(loaded.workflows.len(), 2);
+        assert_eq!(loaded.workflows[0].database, "db_first");
+        assert_eq!(loaded.workflows[0].password, "pw-one");
+        assert_eq!(loaded.workflows[1].password, "pw-two");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_legacy_single_workflow_is_migrated_into_the_list() {
+        let dir = std::env::temp_dir().join(format!("mm-wflegacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[workflow]\n\
+             last_run = 'unix:1'\n\
+             instance = 'mysql56'\n\
+             database = 'db_old'\n\
+             username = 'u_old'\n\
+             password = 'old-pw'\n",
+        )
+        .unwrap();
+
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.workflows.len(), 1);
+        assert_eq!(loaded.workflows[0].database, "db_old");
+        assert_eq!(loaded.workflows[0].password, "old-pw");
+        assert!(
+            loaded.workflow.is_none(),
+            "the legacy field must be cleared after migration"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workflow_index_is_one_based_and_bounds_checked() {
+        let mut config = Config::default();
+        config.workflows.push(WorkflowRecord::default());
+        assert_eq!(config.workflow_index(1).unwrap(), 0);
+        assert!(config.workflow_index(0).is_err());
+        assert!(config.workflow_index(2).is_err());
     }
 
     #[test]

@@ -633,12 +633,13 @@ pub fn workflow(ctx: &mut Ctx<'_>, instance_name: &str) -> Result<WorkflowOutcom
         database: database.clone(),
         user: username.clone(),
     });
-    ctx.config.workflow = Some(WorkflowRecord {
+    ctx.config.workflows.push(WorkflowRecord {
         last_run: timestamp(),
         instance: instance_name.to_string(),
         database: database.clone(),
         username: username.clone(),
         password: password.clone(),
+        host: host.clone(),
     });
     ctx.save()?;
 
@@ -678,6 +679,120 @@ fn timestamp() -> String {
     format!("unix:{}", now.as_secs())
 }
 
+/// One row of `mm workflow list`.
+pub struct WorkflowRow {
+    pub index: usize,
+    pub last_run: String,
+    pub instance: String,
+    pub database: String,
+    pub username: String,
+    pub host: String,
+    pub password: String,
+}
+
+pub fn list_workflows(ctx: &Ctx<'_>) -> Vec<WorkflowRow> {
+    ctx.config
+        .workflow_history()
+        .iter()
+        .enumerate()
+        .map(|(position, record)| WorkflowRow {
+            index: position + 1,
+            last_run: record.last_run.clone(),
+            instance: record.instance.clone(),
+            database: record.database.clone(),
+            username: record.username.clone(),
+            host: if record.host.is_empty() {
+                default_host().to_string()
+            } else {
+                record.host.clone()
+            },
+            password: record.password.clone(),
+        })
+        .collect()
+}
+
+/// Full details for one workflow record, addressed by its 1-based index.
+pub fn show_workflow(ctx: &Ctx<'_>, one_based: usize) -> Result<WorkflowRow> {
+    let position = ctx.config.workflow_index(one_based)?;
+    let record = &ctx.config.workflows[position];
+    Ok(WorkflowRow {
+        index: one_based,
+        last_run: record.last_run.clone(),
+        instance: record.instance.clone(),
+        database: record.database.clone(),
+        username: record.username.clone(),
+        host: if record.host.is_empty() {
+            default_host().to_string()
+        } else {
+            record.host.clone()
+        },
+        password: record.password.clone(),
+    })
+}
+
+/// Drops a workflow's database and user, then forgets the record.
+///
+/// Missing objects are tolerated: if a database or account was already removed
+/// by hand, the stale record can still be cleared. `DROP USER IF EXISTS` only
+/// exists from 5.7.8, so older servers get an explicit existence check instead.
+pub fn remove_workflow(ctx: &mut Ctx<'_>, one_based: usize) -> Result<String> {
+    let position = ctx.config.workflow_index(one_based)?;
+    let record = ctx.config.workflows[position].clone();
+    let host = if record.host.is_empty() {
+        default_host().to_string()
+    } else {
+        record.host.clone()
+    };
+
+    let instance = ctx.config.require(&record.instance)?.clone();
+    ensure_running(ctx, &instance)?;
+    let (settings, ini_path) = ctx.settings_for(&instance)?;
+    let client = ctx.client(&instance, &settings, &ini_path);
+
+    sql::validate_schema_name(&record.database)?;
+    sql::validate_user_name(&record.username)?;
+
+    let version = client.detect_version()?;
+
+    // Drop the account first: it holds grants on the schema, and removing the
+    // schema first would leave those grants dangling.
+    let account = sql::account(&record.username, &host);
+    if version.supports_drop_user_if_exists() {
+        client.run_sql(&[format!("DROP USER IF EXISTS {account}")])?;
+    } else {
+        let existing = client.existing_accounts().unwrap_or_default();
+        let target = format!("{}@{}", record.username, host);
+        if existing
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case(&target))
+        {
+            client.run_sql(&[format!("DROP USER {account}")])?;
+        }
+    }
+
+    if sql::is_protected_schema(&record.database) {
+        return Err(AppError::usage(format!(
+            "拒绝删除系统数据库 `{}`",
+            record.database
+        )));
+    }
+    client.run_sql(&[format!(
+        "DROP DATABASE IF EXISTS {}",
+        sql::quote_ident(&record.database)
+    )])?;
+
+    ctx.config.workflows.remove(position);
+    ctx.config
+        .bindings
+        .retain(|item| !(item.instance == record.instance && item.user == record.username));
+    ctx.save()?;
+
+    Ok(format!(
+        "已删除 workflow 记录 {one_based}：数据库 `{}` 与用户 `{}`@`{host}` 均已移除",
+        record.database, record.username
+    ))
+}
+
 /// Validates the host flag once, used by both CLI and interactive paths.
 pub fn default_host() -> &'static str {
     "localhost"
@@ -694,6 +809,70 @@ pub fn instance_names(config: &Config) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_workflow_run_appends_to_the_history() {
+        // Mirrors what `workflow` does after a successful run: push a record.
+        // A regression that overwrites instead of appending would drop the
+        // earlier password, which is exactly what the user must still see.
+        let mut config = Config::default();
+        for (database, password) in [("db_one", "pw-one"), ("db_two", "pw-two")] {
+            config.workflows.push(WorkflowRecord {
+                last_run: "unix:1".to_string(),
+                instance: "mysql56".to_string(),
+                database: database.to_string(),
+                username: format!("u_{database}"),
+                password: password.to_string(),
+                host: "localhost".to_string(),
+            });
+        }
+        assert_eq!(config.workflows.len(), 2);
+        assert_eq!(config.workflows[0].password, "pw-one");
+        assert_eq!(config.workflows[1].password, "pw-two");
+    }
+
+    #[test]
+    fn workflow_list_reports_oldest_first_with_one_based_indexes() {
+        let runner = crate::process::SystemRunner;
+        let mut config = Config::default();
+        for (database, password) in [("db_first", "pw-1"), ("db_second", "pw-2")] {
+            config.workflows.push(WorkflowRecord {
+                last_run: "unix:1".to_string(),
+                instance: "mysql56".to_string(),
+                database: database.to_string(),
+                username: format!("u_{database}"),
+                password: password.to_string(),
+                host: "localhost".to_string(),
+            });
+        }
+        let ctx = Ctx::new(config, &runner);
+
+        let rows = list_workflows(&ctx);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].index, 1);
+        assert_eq!(rows[0].password, "pw-1");
+        assert_eq!(rows[1].index, 2);
+        assert_eq!(rows[1].password, "pw-2");
+
+        // Showing by index resolves to the same record.
+        assert_eq!(show_workflow(&ctx, 2).unwrap().password, "pw-2");
+        assert!(show_workflow(&ctx, 3).is_err());
+        assert!(show_workflow(&ctx, 0).is_err());
+    }
+
+    #[test]
+    fn a_record_without_a_host_falls_back_to_localhost() {
+        let runner = crate::process::SystemRunner;
+        let mut config = Config::default();
+        config.workflows.push(WorkflowRecord {
+            database: "db_x".to_string(),
+            username: "u_x".to_string(),
+            password: "pw".to_string(),
+            ..WorkflowRecord::default()
+        });
+        let ctx = Ctx::new(config, &runner);
+        assert_eq!(list_workflows(&ctx)[0].host, "localhost");
+    }
 
     #[test]
     fn unique_name_never_returns_a_colliding_database_name() {

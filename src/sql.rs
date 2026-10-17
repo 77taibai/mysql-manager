@@ -149,6 +149,16 @@ impl ServerVersion {
             }
     }
 
+    /// `DROP USER IF EXISTS` exists from 5.7.8 onwards.
+    pub fn supports_drop_user_if_exists(&self) -> bool {
+        *self
+            >= Self {
+                major: 5,
+                minor: 7,
+                patch: 8,
+            }
+    }
+
     /// `utf8mb4` is available from 5.5.3 onwards.
     pub fn supports_utf8mb4(&self) -> bool {
         *self
@@ -439,6 +449,26 @@ mod tests {
             patch: 2
         }
         .supports_utf8mb4());
+    }
+
+    #[test]
+    fn drop_user_if_exists_is_gated_at_578() {
+        // MySQL 5.6 rejects `DROP USER IF EXISTS` with a syntax error, so the
+        // capability boundary matters for correctness, not just tidiness.
+        assert!(!V56.supports_drop_user_if_exists());
+        assert!(!ServerVersion {
+            major: 5,
+            minor: 7,
+            patch: 7
+        }
+        .supports_drop_user_if_exists());
+        assert!(ServerVersion {
+            major: 5,
+            minor: 7,
+            patch: 8
+        }
+        .supports_drop_user_if_exists());
+        assert!(V80.supports_drop_user_if_exists());
     }
 
     #[test]

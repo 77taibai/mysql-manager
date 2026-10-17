@@ -104,6 +104,8 @@ pub fn run_menu(ctx: &mut Ctx<'_>) -> Result<()> {
         println!("  5) 创建用户");
         println!("  6) 绑定用户到数据库");
         println!("  7) 一键测试工作流");
+        println!("  8) 查看 workflow 记录");
+        println!("  9) 删除 workflow 记录");
         println!("  0) 退出");
 
         let input = match read_line("\n请选择：")? {
@@ -145,6 +147,15 @@ pub fn run_menu(ctx: &mut Ctx<'_>) -> Result<()> {
                 Ok(()) => {}
                 Err(error) => eprintln!("错误：{error}"),
             },
+            "8" => {
+                if let Err(error) = print_workflows(ctx) {
+                    eprintln!("错误：{error}");
+                }
+            }
+            "9" => match run_remove_workflow(ctx) {
+                Ok(message) => println!("{message}"),
+                Err(error) => eprintln!("错误：{error}"),
+            },
             other => println!("无效的选项：{other}"),
         }
     }
@@ -153,6 +164,61 @@ pub fn run_menu(ctx: &mut Ctx<'_>) -> Result<()> {
 fn run_start(ctx: &mut Ctx<'_>) -> Result<String> {
     let name = pick_instance(ctx)?;
     commands::start_instance(ctx, &name)
+}
+
+/// Prints the workflow history, including the generated passwords so an
+/// earlier run's credentials stay recoverable.
+fn print_workflows(ctx: &Ctx<'_>) -> Result<()> {
+    let rows = commands::list_workflows(ctx);
+    if rows.is_empty() {
+        println!("暂无 workflow 记录。");
+        println!("运行「一键测试工作流」可创建一条。");
+        return Ok(());
+    }
+    println!();
+    println!(
+        "{:<5} {:<14} {:<12} {:<16} {:<22} 密码",
+        "序号", "时间", "实例", "数据库", "用户"
+    );
+    for row in &rows {
+        println!(
+            "{:<5} {:<14} {:<12} {:<16} {:<22} {}",
+            row.index,
+            row.last_run,
+            row.instance,
+            row.database,
+            format!("{}@{}", row.username, row.host),
+            row.password
+        );
+    }
+    println!();
+    println!("查看单条完整信息请用：mm workflows show <序号>");
+    Ok(())
+}
+
+fn run_remove_workflow(ctx: &mut Ctx<'_>) -> Result<String> {
+    let rows = commands::list_workflows(ctx);
+    if rows.is_empty() {
+        return Err(AppError::usage("暂无 workflow 记录可删除".to_string()));
+    }
+    let labels: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}) {} · {} · {}@{}",
+                row.index, row.instance, row.database, row.username, row.host
+            )
+        })
+        .collect();
+    let choice = choose("请选择要删除的记录", &labels)?;
+    let index = rows[choice].index;
+    if !confirm(&format!(
+        "将删除数据库 `{}` 与用户 `{}`@`{}`，确定吗？",
+        rows[choice].database, rows[choice].username, rows[choice].host
+    ))? {
+        return Ok("已取消。".to_string());
+    }
+    commands::remove_workflow(ctx, index)
 }
 
 fn run_stop(ctx: &mut Ctx<'_>) -> Result<String> {

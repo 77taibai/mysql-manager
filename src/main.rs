@@ -85,6 +85,11 @@ enum Command {
     },
     /// 执行一键测试工作流
     Workflow { name: Option<String> },
+    /// 查看或删除历史 workflow 记录
+    Workflows {
+        #[command(subcommand)]
+        action: WorkflowAction,
+    },
     /// 设置或更新某个实例的 root 密码
     Login {
         name: String,
@@ -113,6 +118,16 @@ enum InstanceAction {
     List,
     /// 从配置中移除实例，不改动其文件
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum WorkflowAction {
+    /// 列出全部 workflow 记录
+    List,
+    /// 查看单条记录的完整信息（含密码）
+    Show { index: usize },
+    /// 删除记录，同时删除其数据库与用户
+    Remove { index: usize },
 }
 
 #[derive(Subcommand)]
@@ -316,6 +331,43 @@ fn run(cli: Cli, runner: &dyn Runner) -> Result<()> {
             }
             ui::print_workflow_result(&outcome);
         }
+        Command::Workflows { action } => match action {
+            WorkflowAction::List => {
+                let rows = commands::list_workflows(&ctx);
+                if rows.is_empty() {
+                    println!("暂无 workflow 记录。");
+                    println!("运行 `mm workflow` 可创建一条。");
+                } else {
+                    println!(
+                        "{:<5} {:<14} {:<12} {:<16} {:<22} 密码",
+                        "序号", "时间", "实例", "数据库", "用户"
+                    );
+                    for row in rows {
+                        println!(
+                            "{:<5} {:<14} {:<12} {:<16} {:<22} {}",
+                            row.index,
+                            row.last_run,
+                            row.instance,
+                            row.database,
+                            format!("{}@{}", row.username, row.host),
+                            row.password
+                        );
+                    }
+                }
+            }
+            WorkflowAction::Show { index } => {
+                let row = commands::show_workflow(&ctx, index)?;
+                println!("workflow 记录 {index}");
+                println!("  时间：  {}", row.last_run);
+                println!("  实例：  {}", row.instance);
+                println!("  数据库：{}", row.database);
+                println!("  用户：  {}@{}", row.username, row.host);
+                println!("  密码：  {}", row.password);
+            }
+            WorkflowAction::Remove { index } => {
+                println!("{}", commands::remove_workflow(&mut ctx, index)?)
+            }
+        },
         Command::Login { name, password } => {
             let password = match password {
                 Some(value) => value,
