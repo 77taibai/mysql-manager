@@ -1,0 +1,6 @@
+/target
+
+# Runtime configuration holds instance root passwords, so it must never be
+# committed. It lives next to the built executable.
+config.toml
+config.toml.tmp
