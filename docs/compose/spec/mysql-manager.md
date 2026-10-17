@@ -111,7 +111,9 @@ password = "Xk9#mQ2p"
 
 ### [S2.4] 启停
 
-**start**：读 `my.ini` 得 datadir 与 port → 若该实例已在运行则报错退出 → 以 `mysqld --defaults-file=<my_ini>` 启动，创建时不带控制台窗口、父进程退出后子进程继续存活 → 记录 PID 到配置 → 轮询 `mysqladmin ping` 直到就绪或超时（默认 30 秒）→ 超时则终止子进程并报错，附 datadir 下 `.err` 日志路径。
+**start**：先检查**其它**已登记实例是否有正在运行的，若有则拒绝并指明是哪个实例、如何停止 → 读 `my.ini` 得 datadir 与 port → 若该实例已在运行则报错退出 → 以 `mysqld --defaults-file=<my_ini>` 启动，创建时不带控制台窗口、父进程退出后子进程继续存活 → 记录 PID 到配置 → 轮询 `mysqladmin ping` 直到就绪或超时（默认 30 秒）→ 超时则终止子进程并报错，附 datadir 下 `.err` 日志路径。
+
+**全局互斥**：同一时间只允许运行一个实例，从根本上保证端口不会被两个 `mysqld` 重复占用。判定依据是其它实例的 `mysqladmin ping` 是否应答，而不是端口号比较——因为 `my.ini` 里的端口可能被用户改动。`my.ini` 读取失败的实例视为「无法判定」而跳过，避免一个损坏的配置挡住健康实例的启动。`workflow` 走同一条检查。
 
 **stop**：优先 `mysqladmin -u root shutdown`；失败或超时则按记录的 PID 强制终止进程，但仅在 `tasklist` 确认该 PID 仍是 `mysqld.exe` 时才杀（防止 PID 被系统复用后误杀无关进程）。若强制终止被拒绝，报错并保留 `last_pid`，不谎报成功。成功后清除 `last_pid`。
 

@@ -59,6 +59,7 @@ mm                        # 交互式菜单
 - **`bind` 是独占的。** 它先确认目标账号没有全局权限，再授予目标库 `ALL PRIVILEGES`、回收全局权限，最后回读 `SHOW GRANTS` 证明别处没有残留权限。已绑定到其它库的用户会被拒绝，需先 `mm unbind`。
 - **密码不进命令行。** SQL 通过实例自带的 `mysql.exe` 执行，root 密码走临时 `--defaults-file`（用完即删），DDL 脚本经标准输入传入。
 - **按版本生成 SQL。** `CREATE USER IF NOT EXISTS` 与 `utf8mb4` 只在服务端支持时使用（5.7.6+ / 5.5.3+）；MySQL 8 的账号使用 `mysql_native_password` 以兼容旧客户端。
+- **同一时间只运行一个实例。** 启动前会检查其它已登记实例是否在运行，若有则拒绝并提示先停止哪个。这样端口永远不会被两个 `mysqld` 重复占用。判定依据是实际连通性而非端口号比较，因此即使你改过 `my.ini` 的端口也依然可靠。
 - **受保护对象。** `mysql`、`information_schema`、`performance_schema`、`sys` 这些系统库以及 `root` 账号，都不能被删除或绑定。
 
 ## 关于 PowerShell 的提示

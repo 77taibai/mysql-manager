@@ -199,8 +199,43 @@ pub fn list_instances(ctx: &Ctx<'_>) -> Result<Vec<InstanceRow>> {
     Ok(rows)
 }
 
+/// Finds another registered instance that is currently running. Only one
+/// instance may run at a time, so every start path consults this first.
+///
+/// An instance whose `my.ini` cannot be read is skipped rather than treated as
+/// running: a broken configuration should not block starting a healthy one.
+fn find_running_other(ctx: &Ctx<'_>, exclude: &str) -> Option<String> {
+    for other in &ctx.config.instances {
+        if other.name == exclude {
+            continue;
+        }
+        let Ok((settings, ini_path)) = ctx.settings_for(other) else {
+            continue;
+        };
+        if matches!(
+            ctx.lifecycle().status(other, &settings, &ini_path),
+            Ok(Status::Running)
+        ) {
+            return Some(other.name.clone());
+        }
+    }
+    None
+}
+
+/// Rejects a start when another instance already owns the machine's MySQL
+/// ports, so two servers can never compete for the same port.
+fn ensure_no_other_running(ctx: &Ctx<'_>, name: &str) -> Result<()> {
+    if let Some(running) = find_running_other(ctx, name) {
+        return Err(AppError::mysql(format!(
+            "实例 `{running}` 正在运行，同一时间只允许运行一个实例；请先执行 `mm stop {running}` 再启动 `{name}`"
+        )));
+    }
+    Ok(())
+}
+
 pub fn start_instance(ctx: &mut Ctx<'_>, name: &str) -> Result<String> {
     let instance = ctx.config.require(name)?.clone();
+    ensure_no_other_running(ctx, name)?;
     let (settings, ini_path) = ctx.settings_for(&instance)?;
     let mut lifecycle = ctx.lifecycle();
     let pid = lifecycle.start(&instance, &settings, &ini_path)?;
@@ -548,6 +583,7 @@ pub struct WorkflowOutcome {
 /// database and user, bind them exclusively, and prove the account works.
 pub fn workflow(ctx: &mut Ctx<'_>, instance_name: &str) -> Result<WorkflowOutcome> {
     let instance = ctx.config.require(instance_name)?.clone();
+    ensure_no_other_running(ctx, instance_name)?;
     let (settings, ini_path) = ctx.settings_for(&instance)?;
     let mut lifecycle = ctx.lifecycle();
 
@@ -679,6 +715,118 @@ mod tests {
         let existing = vec!["db_aaaaaa".to_string()];
         let error = unique_name(&existing, constant).unwrap_err();
         assert!(error.to_string().contains("不重复的名称"));
+    }
+
+    /// Builds a config with two instances whose option files really exist, so
+    /// the exclusivity check can reach the liveness probe.
+    fn two_instance_ctx<'a>(
+        runner: &'a dyn crate::process::Runner,
+        dir: &std::path::Path,
+    ) -> Ctx<'a> {
+        let mut config = Config::default();
+        for (name, port) in [("alpha", 3306u16), ("beta", 3307u16)] {
+            let ini = dir.join(format!("{name}.ini"));
+            std::fs::write(
+                &ini,
+                format!("[mysqld]\ndatadir={}\nport={port}\n", dir.display()),
+            )
+            .unwrap();
+            config.instances.push(Instance {
+                name: name.to_string(),
+                home: dir.display().to_string(),
+                my_ini: Some(ini.display().to_string()),
+                root_password: String::new(),
+                last_pid: None,
+            });
+        }
+        Ctx::new(config, runner)
+    }
+
+    #[test]
+    fn starting_a_second_instance_is_refused_while_another_runs() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-excl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        // First status probe (alpha, excluded) is skipped; beta answers.
+        runner.push_ok("mysqld is alive");
+        let mut ctx = two_instance_ctx(&runner, &dir);
+
+        let error = ensure_no_other_running(&ctx, "alpha").unwrap_err();
+        assert!(error.to_string().contains("beta"), "got: {error}");
+        assert!(
+            error.to_string().contains("只允许运行一个实例"),
+            "got: {error}"
+        );
+        assert!(error.to_string().contains("mm stop beta"), "got: {error}");
+        std::fs::remove_dir_all(&dir).ok();
+        // Silence the unused-mut warning on the binding.
+        let _ = &mut ctx;
+    }
+
+    #[test]
+    fn starting_is_allowed_when_no_other_instance_answers() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-excl2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        runner.push_fail(1, "unreachable");
+        let ctx = two_instance_ctx(&runner, &dir);
+
+        ensure_no_other_running(&ctx, "alpha").expect("no other instance is running");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_instance_being_started_is_not_counted_as_a_conflict() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-excl3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        // Only one probe is issued because the excluded instance is skipped.
+        runner.push_fail(1, "unreachable");
+        let ctx = two_instance_ctx(&runner, &dir);
+
+        ensure_no_other_running(&ctx, "alpha").expect("alpha itself must be ignored");
+        // Exactly one probe means beta was checked and alpha was skipped.
+        assert_eq!(runner.invocations().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_broken_other_instance_does_not_block_starting() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-excl4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        let mut config = Config::default();
+        // A healthy target instance.
+        let ini = dir.join("ok.ini");
+        std::fs::write(
+            &ini,
+            format!("[mysqld]\ndatadir={}\nport=3306\n", dir.display()),
+        )
+        .unwrap();
+        config.instances.push(Instance {
+            name: "ok".to_string(),
+            home: dir.display().to_string(),
+            my_ini: Some(ini.display().to_string()),
+            root_password: String::new(),
+            last_pid: None,
+        });
+        // Another instance whose option file is missing entirely.
+        config.instances.push(Instance {
+            name: "broken".to_string(),
+            home: dir.display().to_string(),
+            my_ini: Some(dir.join("missing.ini").display().to_string()),
+            root_password: String::new(),
+            last_pid: None,
+        });
+        let ctx = Ctx::new(config, &runner);
+
+        ensure_no_other_running(&ctx, "ok")
+            .expect("a broken sibling configuration must not block a start");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
