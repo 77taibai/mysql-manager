@@ -1,9 +1,9 @@
 ---
 feature: mysql-manager
-status: designed
-updated: 2026-02-14
+status: delivered
+updated: 2026-10-17
 branch: main
-commits:
+commits: 6dc9295..bfb4074
 ---
 
 # MySQL Manager (mm)
@@ -11,6 +11,26 @@ commits:
 一个运行在 Windows 11 上的 Rust 命令行工具，用于管理本机多个 MySQL 实例的按需启停，以及库/用户的创建、删除与一对一权限绑定。
 
 ## Report
+
+**What was built** — `mm` 是一个单文件 Windows CLI（`target\release\mm.exe`），无参数运行进入交互式菜单，带子命令则可脚本化。它从 `my.ini` 的 `[mysqld]` 段实时读取 datadir/port，以 `mysqld --defaults-file` 后台脱离启动、记录 PID、轮询就绪，停止时优先 `mysqladmin shutdown` 再退回按 PID 强制终止。所有 SQL 走实例自带的 `mysql.exe`，root 密码经临时 defaults-file 传递、用完即删，DDL 脚本经 stdin 传入，因此任何密码都不出现在进程命令行。`bind` 先校验目标账号不持有全局权限，再 `REVOKE ALL PRIVILEGES, GRANT OPTION` 并只授予目标库，最后回读 `SHOW GRANTS` 证明隔离生效。`workflow` 一键完成选实例→启动→随机建库建用户→绑定→用新账号实际连通验证→打印并落盘。
+
+**Verification** — 全部在本机真实 MySQL 5.6.51 上执行：
+- `cargo test` → PASS，71 passed / 0 failed
+- `cargo clippy --all-targets -- -D warnings` → PASS，无警告
+- `cargo fmt --check` → PASS
+- `cargo build --release` → PASS
+- `instance add` → 自动识别 `version: 5.6.51`，datadir/port 取自 my.ini
+- `start` → 2.7s 内返回并 `status` 显示 Running；`stop` → 干净停止；重复 start 报错
+- `workflow` → 生成 `db_7stovh` / `u_wy5gew`，新账号连通验证通过，凭据落盘
+- 隔离验证 → 该账号 `SHOW GRANTS` 仅 `GRANT USAGE ON *.*` + `GRANT ALL PRIVILEGES ON \`db_7stovh\`.*`；访问 `mysql` 库返回 `ERROR 1044`，访问自己的库成功
+- 防护验证 → `bind ... root`、`bind ... mysql`、`db remove mysql`、`user remove root` 全部以退出码 2 拒绝；事后 root 的 `GRANT ALL PRIVILEGES ON *.* ... WITH GRANT OPTION` 完好
+- 清理 → 测试库/用户删除，实例停止，无残留 mysqld 进程
+
+**Journey log** —
+- 「`mm start` 卡住」最初被误判为句柄继承泄漏。用一个只启动 `ping` 的独立探针复现后确认：即使完全不设置 stdio 仍然卡住，所以是 PowerShell 管道等待 DETACHED_PROCESS 子进程的自身行为，与 mm 无关；cmd 重定向 2.7s 正常返回。README 已记录该限制。
+- 版本解析原实现取整串第一个数字，而 `mysqld --version` 会把 argv[0] 打印在最前，路径含数字（如 `mysql8`）就会误判成 8.0 并在 5.6 上发 8.0 语法。改为锚定 `Ver ` 横幅，并加了两条针对性回归测试。
+- `bind` 最初只挡系统库、不挡 root，而绑定会回收全局权限——对 root 执行等于废掉实例自身的管理能力。改为 SQL 构建器与命令层双重拦截，并额外加了一层「目标账号已持有全局权限则拒绝」的前置检查，覆盖 root 之外的管理账号。
+- 账号密码原先随 DDL 经 `-e` 进入命令行。改为 `Runner::run_with_stdin` 走管道后，还需处理子进程提前关闭 stdin 的情形：断管不能掩盖真实 stderr，否则 `ERROR 1045` 会被替换成难懂的管道错误。
 
 ## [S1] Problem
 
@@ -93,7 +113,7 @@ password = "Xk9#mQ2p"
 
 **start**：读 `my.ini` 得 datadir 与 port → 若该实例已在运行则报错退出 → 以 `mysqld --defaults-file=<my_ini>` 启动，创建时不带控制台窗口、父进程退出后子进程继续存活 → 记录 PID 到配置 → 轮询 `mysqladmin ping` 直到就绪或超时（默认 30 秒）→ 超时则终止子进程并报错，附 datadir 下 `.err` 日志路径。
 
-**stop**：优先 `mysqladmin -u root shutdown`；失败或超时则按记录的 PID 强制终止进程。成功后清除 `last_pid`。
+**stop**：优先 `mysqladmin -u root shutdown`；失败或超时则按记录的 PID 强制终止进程，但仅在 `tasklist` 确认该 PID 仍是 `mysqld.exe` 时才杀（防止 PID 被系统复用后误杀无关进程）。若强制终止被拒绝，报错并保留 `last_pid`，不谎报成功。成功后清除 `last_pid`。
 
 **status**：`mysqladmin ping` 成功即 Running，否则 Stopped。同时校验 PID 存活，防止 PID 被系统复用造成误判。
 
@@ -105,9 +125,9 @@ password = "Xk9#mQ2p"
 
 密码传递方式：生成临时 `--defaults-file` 文件（内容 `[client]\nuser=root\npassword=...\nport=...`），以该文件调用 mysql.exe，用完立即删除。避免密码出现在进程命令行被其它进程读取。
 
-调用约定：`mysql.exe --defaults-file=<tmp> --batch --skip-column-names -e "<sql>"`，捕获 stdout/stderr 与退出码。非零退出码时把 stderr 原文带回给用户，不做改写，便于定位真实 SQL 错误。
+调用约定：`mysql.exe --defaults-file=<tmp> --batch --skip-column-names`，SQL 脚本经 **stdin** 传入（不走 `-e`），因此账号密码这类嵌在 DDL 文本里的秘密也不会出现在进程命令行。捕获 stdout/stderr 与退出码；非零退出码时把 stderr 原文带回给用户，不做改写。子进程若提前关闭 stdin 导致断管，不能掩盖其真实 stderr 与退出码。
 
-**版本分支**：启动前用 `mysqld --version` 解析主版本号并缓存。
+**版本分支**：启动前用 `mysqld --version` 解析主版本号并缓存。解析时锚定 `Ver ` 横幅（取最后一处），而非整串首个数字——该命令会把 argv[0] 打印在最前，路径中含数字（如 `mysql8`）会污染结果。
 
 - `>= 8.0`：`CREATE USER IF NOT EXISTS '<u>'@'<h>' IDENTIFIED BY '<p>'`；授权后如需回收用 `REVOKE ALL PRIVILEGES, GRANT OPTION FROM`
 - `< 8.0`（5.5/5.6/5.7）：`CREATE USER '<u>'@'<h>' IDENTIFIED BY '<p>'`（无 `IF NOT EXISTS`），建用户前先查 `mysql.user` 判断是否已存在
@@ -133,6 +153,8 @@ password = "Xk9#mQ2p"
 4. `FLUSH PRIVILEGES`
 
 不授予 `GRANT OPTION`，不授予全局级权限。这样即使该账号密码泄露，也无法触碰其它库。
+
+**前置检查**：绑定会回收全局权限，因此执行前先读 `SHOW GRANTS`；若目标账号已持有任何全局级权限（`ON *.*`），直接拒绝，避免把 root 或其它管理账号的权限废掉。系统库（`mysql` 等）与受保护账号（`root`、`mysql.sys`、`mysql.session`）在 SQL 构建器与命令层双重拦截。
 
 若该用户已被绑定到另一个库，`bind` 拒绝执行并提示先 `unbind`，避免静默改绑造成误解。
 
@@ -179,10 +201,10 @@ password = "Xk9#mQ2p"
 
 ## Tasks
 
-- [ ] T1: 建立 cargo 项目骨架，实现配置文件定位（`current_exe` 同级）与 `config.toml` 读写 — acceptance: `cargo build` 通过；单元测试验证配置往返读写与「文件不存在时返回空清单」 (covers: S2.3, S2.9)
-- [ ] T2: 实现 `my.ini` 解析（`[mysqld]` 段的 basedir/datadir/port）与实例登记三命令 — acceptance: `mm instance add` 对有效目录成功、对缺少 `mysqld.exe` 的目录报错退出码 3；`mm instance list` 输出已登记项；单元测试覆盖 ini 解析的各种格式 (covers: S2.2)
-- [ ] T3: 实现 start/stop/status，后台启动 mysqld、PID 记录、就绪轮询与强制终止 — acceptance: 对本机 5.6.51 执行 `mm start mysql56` 后 `mm status` 显示 Running，`mm stop` 后显示 Stopped；重复 start 报错 (covers: S2.4)
-- [ ] T4: 实现 SQL 执行层，含版本分支、临时 defaults-file、标识符与密码转义 — acceptance: 单元测试验证 5.6 与 8.0 生成的 SQL 语句差异、非法标识符被拒、密码中的引号被正确转义 (covers: S2.5, S2.9)
-- [ ] T5: 实现 user/db 增删与 `bind` 一对一独占绑定 — acceptance: 在本机 5.6.51 上建库建用户后绑定，`SHOW GRANTS` 仅含该库权限；`bind` 到第二个库被拒绝；系统库与 root 的删除被拒 (covers: S2.6, S2.7)
-- [ ] T6: 实现无参数交互式菜单与 `mm workflow` 一键工作流 — acceptance: `mm workflow` 完成选实例→启动→随机建库建用户→绑定→新账号连通验证→打印并落盘；配置文件中出现 `[workflow]` 段 (covers: S2.8)
-- [ ] T7: 补齐错误码一致性、密码不回显、临时文件清理，并跑通 `cargo test` / `cargo clippy` / `cargo build --release` — acceptance: 三条命令均无 error；clippy 无 warning (covers: S2.9, S2.10)
+- [x] T1: 建立 cargo 项目骨架，实现配置文件定位（`current_exe` 同级）与 `config.toml` 读写 — acceptance: `cargo build` 通过；单元测试验证配置往返读写与「文件不存在时返回空清单」 (covers: S2.3, S2.9)
+- [x] T2: 实现 `my.ini` 解析（`[mysqld]` 段的 basedir/datadir/port）与实例登记三命令 — acceptance: `mm instance add` 对有效目录成功、对缺少 `mysqld.exe` 的目录报错退出码 3；`mm instance list` 输出已登记项；单元测试覆盖 ini 解析的各种格式 (covers: S2.2)
+- [x] T3: 实现 start/stop/status，后台启动 mysqld、PID 记录、就绪轮询与强制终止 — acceptance: 对本机 5.6.51 执行 `mm start mysql56` 后 `mm status` 显示 Running，`mm stop` 后显示 Stopped；重复 start 报错 (covers: S2.4)
+- [x] T4: 实现 SQL 执行层，含版本分支、临时 defaults-file、标识符与密码转义 — acceptance: 单元测试验证 5.6 与 8.0 生成的 SQL 语句差异、非法标识符被拒、密码中的引号被正确转义 (covers: S2.5, S2.9)
+- [x] T5: 实现 user/db 增删与 `bind` 一对一独占绑定 — acceptance: 在本机 5.6.51 上建库建用户后绑定，`SHOW GRANTS` 仅含该库权限；`bind` 到第二个库被拒绝；系统库与 root 的删除被拒 (covers: S2.6, S2.7)
+- [x] T6: 实现无参数交互式菜单与 `mm workflow` 一键工作流 — acceptance: `mm workflow` 完成选实例→启动→随机建库建用户→绑定→新账号连通验证→打印并落盘；配置文件中出现 `[workflow]` 段 (covers: S2.8)
+- [x] T7: 补齐错误码一致性、密码不回显、临时文件清理，并跑通 `cargo test` / `cargo clippy` / `cargo build --release` — acceptance: 三条命令均无 error；clippy 无 warning (covers: S2.9, S2.10)
