@@ -23,7 +23,10 @@ impl<'a> Ctx<'a> {
 
     /// Loads `my.ini` for an instance, turning a missing file into a clear
     /// error that names the expected path.
-    pub fn settings_for(&self, instance: &Instance) -> Result<(ini::MysqldSettings, std::path::PathBuf)> {
+    pub fn settings_for(
+        &self,
+        instance: &Instance,
+    ) -> Result<(ini::MysqldSettings, std::path::PathBuf)> {
         let ini_path = instance.my_ini_path();
         if !ini_path.exists() {
             return Err(AppError::instance(format!(
@@ -126,12 +129,18 @@ pub fn remove_instance(ctx: &mut Ctx<'_>, name: &str) -> Result<String> {
         .position(|item| item.name == name)
         .ok_or_else(|| AppError::instance(format!("instance `{name}` is not registered")))?;
 
-    let removed_bindings = ctx.config.bindings.iter().filter(|item| item.instance == name).count();
+    let removed_bindings = ctx
+        .config
+        .bindings
+        .iter()
+        .filter(|item| item.instance == name)
+        .count();
     ctx.config.instances.remove(index);
     ctx.config.bindings.retain(|item| item.instance != name);
     ctx.save()?;
 
-    let mut message = format!("removed instance `{name}` from the configuration (files were not touched)");
+    let mut message =
+        format!("removed instance `{name}` from the configuration (files were not touched)");
     if removed_bindings > 0 {
         message.push_str(&format!(
             "\n{removed_bindings} binding record(s) for this instance were removed as well"
@@ -165,7 +174,10 @@ pub fn list_instances(ctx: &Ctx<'_>) -> Result<Vec<InstanceRow>> {
                 };
                 (
                     version,
-                    settings.port.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string()),
+                    settings
+                        .port
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
                     status.to_string(),
                     settings.datadir.unwrap_or_else(|| "-".to_string()),
                 )
@@ -286,7 +298,10 @@ pub fn add_user(
     if !version.supports_create_user_if_not_exists() {
         let existing = client.existing_accounts().unwrap_or_default();
         let target = format!("{user}@{host}");
-        if existing.iter().any(|item| item.eq_ignore_ascii_case(&target)) {
+        if existing
+            .iter()
+            .any(|item| item.eq_ignore_ascii_case(&target))
+        {
             return Err(AppError::mysql(format!(
                 "user `{target}` already exists on `{instance_name}`"
             )));
@@ -295,10 +310,17 @@ pub fn add_user(
 
     let plan = sql::create_user_sql(version, user, host, password)?;
     client.run_sql(&plan.statements)?;
-    Ok(format!("created user `{user}`@`{host}` on `{instance_name}`"))
+    Ok(format!(
+        "created user `{user}`@`{host}` on `{instance_name}`"
+    ))
 }
 
-pub fn remove_user(ctx: &mut Ctx<'_>, instance_name: &str, user: &str, host: &str) -> Result<String> {
+pub fn remove_user(
+    ctx: &mut Ctx<'_>,
+    instance_name: &str,
+    user: &str,
+    host: &str,
+) -> Result<String> {
     sql::validate_user_name(user)?;
     sql::validate_host(host)?;
     if sql::is_protected_user(user) {
@@ -322,7 +344,9 @@ pub fn remove_user(ctx: &mut Ctx<'_>, instance_name: &str, user: &str, host: &st
 
     let mut message = format!("dropped user `{user}`@`{host}` on `{instance_name}`");
     if dropped_bindings > 0 {
-        message.push_str(&format!("\n{dropped_bindings} binding record(s) were removed as well"));
+        message.push_str(&format!(
+            "\n{dropped_bindings} binding record(s) were removed as well"
+        ));
     }
     Ok(message)
 }
@@ -346,7 +370,9 @@ pub fn add_database(ctx: &mut Ctx<'_>, instance_name: &str, database: &str) -> R
     let version = client.detect_version()?;
     let plan = sql::create_database_sql(version, database)?;
     client.run_sql(&plan.statements)?;
-    Ok(format!("created database `{database}` on `{instance_name}`"))
+    Ok(format!(
+        "created database `{database}` on `{instance_name}`"
+    ))
 }
 
 pub fn remove_database(ctx: &mut Ctx<'_>, instance_name: &str, database: &str) -> Result<String> {
@@ -372,7 +398,9 @@ pub fn remove_database(ctx: &mut Ctx<'_>, instance_name: &str, database: &str) -
 
     let mut message = format!("dropped database `{database}` on `{instance_name}`");
     if dropped_bindings > 0 {
-        message.push_str(&format!("\n{dropped_bindings} binding record(s) were removed as well"));
+        message.push_str(&format!(
+            "\n{dropped_bindings} binding record(s) were removed as well"
+        ));
     }
     Ok(message)
 }
@@ -389,7 +417,13 @@ pub fn list_databases(ctx: &Ctx<'_>, instance_name: &str) -> Result<Vec<String>>
 
 /// Binds a user to exactly one database: grant on that schema, revoke
 /// everything else, then report the privileges that actually took effect.
-pub fn bind(ctx: &mut Ctx<'_>, instance_name: &str, database: &str, user: &str, host: &str) -> Result<String> {
+pub fn bind(
+    ctx: &mut Ctx<'_>,
+    instance_name: &str,
+    database: &str,
+    user: &str,
+    host: &str,
+) -> Result<String> {
     sql::validate_schema_name(database)?;
     sql::validate_user_name(user)?;
     sql::validate_host(host)?;
@@ -398,16 +432,18 @@ pub fn bind(ctx: &mut Ctx<'_>, instance_name: &str, database: &str, user: &str, 
             "refusing to bind an account to the system database `{database}`"
         )));
     }
+    if sql::is_protected_user(user) {
+        return Err(AppError::usage(format!(
+            "refusing to bind the protected account `{user}`; binding revokes its global privileges"
+        )));
+    }
 
     let instance = ctx.config.require(instance_name)?.clone();
     ensure_running(ctx, &instance)?;
 
-    if let Some(existing) = ctx
-        .config
-        .bindings
-        .iter()
-        .find(|item| item.instance == instance_name && item.user == user && item.database != database)
-    {
+    if let Some(existing) = ctx.config.bindings.iter().find(|item| {
+        item.instance == instance_name && item.user == user && item.database != database
+    }) {
         return Err(AppError::usage(format!(
             "user `{user}` is already bound to `{}`; run `mm unbind {instance_name} {user}` first",
             existing.database
@@ -459,6 +495,11 @@ pub fn bind(ctx: &mut Ctx<'_>, instance_name: &str, database: &str, user: &str, 
 pub fn unbind(ctx: &mut Ctx<'_>, instance_name: &str, user: &str, host: &str) -> Result<String> {
     sql::validate_user_name(user)?;
     sql::validate_host(host)?;
+    if sql::is_protected_user(user) {
+        return Err(AppError::usage(format!(
+            "refusing to unbind the protected account `{user}`"
+        )));
+    }
     let instance = ctx.config.require(instance_name)?.clone();
 
     let binding = ctx
@@ -523,9 +564,9 @@ pub fn workflow(ctx: &mut Ctx<'_>, instance_name: &str) -> Result<WorkflowOutcom
     let version = client.detect_version()?;
 
     let existing_schemas = client.existing_schemas().unwrap_or_default();
-    let database = unique_name(&existing_schemas, sql::random_database_name);
+    let database = unique_name(&existing_schemas, sql::random_database_name)?;
     let existing_accounts = client.existing_accounts().unwrap_or_default();
-    let username = unique_name(&existing_accounts, sql::random_user_name);
+    let username = unique_name(&existing_accounts, sql::random_user_name)?;
     let password = sql::random_password();
     let host = "localhost".to_string();
 
@@ -562,18 +603,22 @@ pub fn workflow(ctx: &mut Ctx<'_>, instance_name: &str) -> Result<WorkflowOutcom
     })
 }
 
-fn unique_name(existing: &[String], generator: fn() -> String) -> String {
+/// Picks the first generated name that is not already present. Returns an error
+/// rather than handing back a name it knows collides, because that would turn a
+/// retryable naming problem into an opaque SQL failure downstream.
+fn unique_name(existing: &[String], generator: fn() -> String) -> Result<String> {
     for _ in 0..64 {
         let candidate = generator();
-        let clash = existing
-            .iter()
-            .any(|item| item.eq_ignore_ascii_case(&candidate) || item.starts_with(&format!("{candidate}@")))
-            ;
+        let clash = existing.iter().any(|item| {
+            item.eq_ignore_ascii_case(&candidate) || item.starts_with(&format!("{candidate}@"))
+        });
         if !clash {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    generator()
+    Err(AppError::general(
+        "could not generate a unique name after 64 attempts".to_string(),
+    ))
 }
 
 fn timestamp() -> String {
@@ -589,7 +634,11 @@ pub fn default_host() -> &'static str {
 }
 
 pub fn instance_names(config: &Config) -> Vec<String> {
-    config.instances.iter().map(|item| item.name.clone()).collect()
+    config
+        .instances
+        .iter()
+        .map(|item| item.name.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -598,34 +647,55 @@ mod tests {
 
     #[test]
     fn unique_name_never_returns_a_colliding_database_name() {
-        // Force a collision by treating every generated name as taken.
         let existing = vec!["db_aaaaaa".to_string()];
         for _ in 0..16 {
-            let candidate = unique_name(&existing, sql::random_database_name);
+            let candidate = unique_name(&existing, sql::random_database_name).unwrap();
             assert!(!existing.contains(&candidate));
             assert!(sql::validate_schema_name(&candidate).is_ok());
         }
     }
 
     #[test]
-    fn unique_name_rejects_a_candidate_that_is_already_taken() {
-        // A generator that always yields the colliding name would loop; the
-        // helper must still terminate and return a name rather than hang.
+    fn unique_name_errors_when_every_candidate_collides() {
+        // A generator that always yields the taken name must fail loudly rather
+        // than return a name known to collide.
         fn constant() -> String {
             "db_aaaaaa".to_string()
         }
         let existing = vec!["db_aaaaaa".to_string()];
-        let result = unique_name(&existing, constant);
-        // After exhausting retries it falls back to the generator's output,
-        // which the caller's uniqueness check treats as a best effort.
-        assert_eq!(result, "db_aaaaaa");
+        let error = unique_name(&existing, constant).unwrap_err();
+        assert!(error.to_string().contains("unique name"));
+    }
+
+    #[test]
+    fn binding_root_is_refused_before_any_sql_runs() {
+        let runner = crate::process::SystemRunner;
+        let mut config = Config::default();
+        config.instances.push(Instance {
+            name: "x".to_string(),
+            home: "C:/x".to_string(),
+            my_ini: None,
+            root_password: String::new(),
+            last_pid: None,
+        });
+        let mut ctx = Ctx::new(config, &runner);
+        let error = bind(&mut ctx, "x", "appdb", "root", "localhost").unwrap_err();
+        assert!(error.to_string().contains("protected account"));
+    }
+
+    #[test]
+    fn unbinding_root_is_refused() {
+        let runner = crate::process::SystemRunner;
+        let mut ctx = Ctx::new(Config::default(), &runner);
+        let error = unbind(&mut ctx, "x", "root", "localhost").unwrap_err();
+        assert!(error.to_string().contains("protected account"));
     }
 
     #[test]
     fn unique_name_avoids_account_collisions() {
         let existing = vec!["u_abc123@localhost".to_string()];
         for _ in 0..16 {
-            let candidate = unique_name(&existing, sql::random_user_name);
+            let candidate = unique_name(&existing, sql::random_user_name).unwrap();
             assert_ne!(candidate, "u_abc123");
         }
     }
@@ -657,10 +727,28 @@ mod tests {
 
     #[test]
     fn add_instance_rejects_a_directory_without_mysqld() {
+        // A real directory that exists but is not a MySQL installation, so the
+        // check under test is the mysqld.exe lookup rather than the is_dir one.
+        let dir = std::env::temp_dir().join(format!("mm-notmysql-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
         let runner = crate::process::SystemRunner;
         let mut ctx = Ctx::new(Config::default(), &runner);
-        let error = add_instance(&mut ctx, "bogus", "C:/definitely/not/mysql", None, None)
-            .unwrap_err();
+        let error =
+            add_instance(&mut ctx, "bogus", &dir.display().to_string(), None, None).unwrap_err();
+        assert!(
+            error.to_string().contains("not a MySQL installation"),
+            "got: {error}"
+        );
+        assert_eq!(error.code(), crate::error::EXIT_INSTANCE);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_instance_rejects_a_missing_directory() {
+        let runner = crate::process::SystemRunner;
+        let mut ctx = Ctx::new(Config::default(), &runner);
+        let error =
+            add_instance(&mut ctx, "bogus", "C:/definitely/not/mysql", None, None).unwrap_err();
         assert!(error.to_string().contains("does not exist"));
         assert_eq!(error.code(), crate::error::EXIT_INSTANCE);
     }
@@ -742,13 +830,5 @@ mod tests {
         assert!(message.contains("binding record"));
         assert!(ctx.config.instances.is_empty());
         assert!(ctx.config.bindings.is_empty());
-    }
-
-    #[test]
-    fn lifecycle_helper_is_available_for_commands() {
-        let runner = crate::process::SystemRunner;
-        let ctx = Ctx::new(Config::default(), &runner);
-        let _ = ctx.lifecycle();
-        let _ = crate::lifecycle::error_log_hint(std::path::Path::new("C:/nope"));
     }
 }

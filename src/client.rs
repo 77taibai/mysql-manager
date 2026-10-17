@@ -96,14 +96,31 @@ impl<'a> MysqlClient<'a> {
         self.runner.run(&program, &args)
     }
 
-    /// Runs one or more statements as root, joining them into a single script.
+    /// Runs one or more statements as root. The script is fed through stdin
+    /// rather than `-e`, so a statement containing a password never appears in
+    /// the process command line.
     pub fn run_sql(&self, statements: &[String]) -> Result<String> {
         if statements.is_empty() {
             return Ok(String::new());
         }
-        let script = statements.join(";\n");
-        let extra = vec!["-e".to_string(), script];
-        let output = self.run_as("root", &self.instance.root_password, &extra)?;
+        let script = format!("{};\n", statements.join(";\n"));
+        let port = self.port()?;
+        let credentials =
+            CredentialFile::create("root", &self.instance.root_password, "127.0.0.1", port)?;
+        let args = vec![
+            format!("--defaults-file={}", credentials.path().display()),
+            "--batch".to_string(),
+            "--skip-column-names".to_string(),
+            "--connect-timeout=10".to_string(),
+        ];
+        let program = self.instance.mysql_exe();
+        if !self.runner.exists(&program) {
+            return Err(AppError::instance(format!(
+                "mysql.exe was not found at {}",
+                program.display()
+            )));
+        }
+        let output = self.runner.run_with_stdin(&program, &args, &script)?;
         if !output.success {
             let detail = output.combined();
             return Err(AppError::mysql(if detail.is_empty() {
@@ -269,7 +286,10 @@ mod tests {
             assert!(file.path().exists());
             file.path().to_path_buf()
         };
-        assert!(!path.exists(), "the credential file must be deleted on drop");
+        assert!(
+            !path.exists(),
+            "the credential file must be deleted on drop"
+        );
     }
 
     #[test]
@@ -296,11 +316,51 @@ mod tests {
         assert!(invocation.program.ends_with("mysql.exe"));
         let joined = invocation.args.join(" ");
         assert!(joined.contains("--defaults-file="));
-        assert!(joined.contains("CREATE DATABASE `x`"));
         assert!(
             !joined.contains("rootpw"),
-            "the password must never appear on the command line"
+            "the root password must never appear on the command line"
         );
+        // The statement itself travels on stdin, not in argv.
+        assert!(
+            !joined.contains("CREATE DATABASE"),
+            "SQL must not be in argv: {joined}"
+        );
+        assert_eq!(
+            runner.stdin_writes(),
+            vec!["CREATE DATABASE `x`;\n".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_created_account_password_never_appears_in_argv() {
+        // This is the case the defaults-file alone does not cover: the new
+        // account's password is part of the DDL text itself.
+        let runner = FakeRunner::new();
+        runner.push_ok("");
+        let inst = instance();
+        let ini_path = ini();
+        let cfg = settings();
+        let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
+
+        let plan = crate::sql::create_user_sql(
+            crate::sql::ServerVersion {
+                major: 5,
+                minor: 6,
+                patch: 51,
+            },
+            "app",
+            "localhost",
+            "sup3rSecret",
+        )
+        .unwrap();
+        client.run_sql(&plan.statements).unwrap();
+
+        let joined = runner.last().args.join(" ");
+        assert!(
+            !joined.contains("sup3rSecret"),
+            "the new account password leaked into argv: {joined}"
+        );
+        assert!(runner.stdin_writes()[0].contains("sup3rSecret"));
     }
 
     #[test]
@@ -364,14 +424,29 @@ mod tests {
     #[test]
     fn version_detection_falls_back_to_stderr() {
         let runner = FakeRunner::new();
-        runner.push_ok("");
+        runner.push_ok_stderr("", "Ver 5.7.44 for Win64 on x86_64");
         let inst = instance();
         let ini_path = ini();
         let cfg = settings();
         let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
-        // FakeRunner returns empty stdout, so the parse must fail cleanly.
+        let version = client.detect_version().unwrap();
+        assert_eq!(version.major, 5);
+        assert_eq!(version.minor, 7);
+        assert_eq!(version.patch, 44);
+    }
+
+    #[test]
+    fn version_detection_fails_cleanly_when_no_version_is_present() {
+        let runner = FakeRunner::new();
+        runner.push_ok("no version here");
+        let inst = instance();
+        let ini_path = ini();
+        let cfg = settings();
+        let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
         let error = client.detect_version().unwrap_err();
-        assert!(error.to_string().contains("cannot determine the MySQL version"));
+        assert!(error
+            .to_string()
+            .contains("cannot determine the MySQL version"));
     }
 
     #[test]

@@ -36,7 +36,9 @@ fn require_non_empty(prompt: &str) -> Result<String> {
 /// Presents a numbered list and returns the chosen index.
 fn choose(prompt: &str, options: &[String]) -> Result<usize> {
     if options.is_empty() {
-        return Err(AppError::usage("there is nothing to choose from".to_string()));
+        return Err(AppError::usage(
+            "there is nothing to choose from".to_string(),
+        ));
     }
     loop {
         println!();
@@ -53,7 +55,10 @@ fn choose(prompt: &str, options: &[String]) -> Result<usize> {
 
 fn confirm(prompt: &str) -> Result<bool> {
     let input = require_line(&format!("{prompt} [y/N]: "))?;
-    Ok(matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Prompts for an instance, or returns the single registered one directly.
@@ -61,7 +66,8 @@ fn pick_instance(ctx: &Ctx<'_>) -> Result<String> {
     let names = commands::instance_names(&ctx.config);
     match names.len() {
         0 => Err(AppError::instance(
-            "no instance is registered; run `mm instance add <name> --home <path>` first".to_string(),
+            "no instance is registered; run `mm instance add <name> --home <path>` first"
+                .to_string(),
         )),
         1 => Ok(names[0].clone()),
         _ => {
@@ -79,7 +85,10 @@ fn print_instances(ctx: &Ctx<'_>) -> Result<()> {
         return Ok(());
     }
     println!();
-    println!("{:<16} {:<10} {:<7} {:<13} DATADIR", "NAME", "VERSION", "PORT", "STATUS");
+    println!(
+        "{:<16} {:<10} {:<7} {:<13} DATADIR",
+        "NAME", "VERSION", "PORT", "STATUS"
+    );
     for row in rows {
         println!(
             "{:<16} {:<10} {:<7} {:<13} {}",

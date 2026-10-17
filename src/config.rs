@@ -115,8 +115,9 @@ pub fn load_from(path: &Path) -> Result<Config> {
 }
 
 pub fn save_to(path: &Path, config: &Config) -> Result<()> {
-    let text = toml::to_string_pretty(config)
-        .map_err(|error| AppError::general(format!("cannot serialize the configuration: {error}")))?;
+    let text = toml::to_string_pretty(config).map_err(|error| {
+        AppError::general(format!("cannot serialize the configuration: {error}"))
+    })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
             AppError::general(format!("cannot create {}: {error}", parent.display()))
@@ -204,16 +205,22 @@ mod tests {
     #[test]
     fn defaults_my_ini_to_the_installation_root() {
         let instance = &sample().instances[0];
-        assert_eq!(instance.my_ini_path(), PathBuf::from(r"C:\mysql\5.6").join("my.ini"));
+        assert_eq!(
+            instance.my_ini_path(),
+            PathBuf::from(r"C:\mysql\5.6").join("my.ini")
+        );
         assert_eq!(
             instance.mysqld_exe(),
-            PathBuf::from(r"C:\mysql\5.6").join("bin").join("mysqld.exe")
+            PathBuf::from(r"C:\mysql\5.6")
+                .join("bin")
+                .join("mysqld.exe")
         );
     }
 
     #[test]
     fn missing_optional_fields_are_tolerated() {
-        let config: Config = toml::from_str("[[instances]]\nname = \"a\"\nhome = \"C:/a\"\n").unwrap();
+        let config: Config =
+            toml::from_str("[[instances]]\nname = \"a\"\nhome = \"C:/a\"\n").unwrap();
         assert_eq!(config.instances[0].root_password, "");
         assert_eq!(config.instances[0].last_pid, None);
         assert!(config.instances[0].my_ini.is_none());

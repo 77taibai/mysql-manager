@@ -161,9 +161,22 @@ impl<'a> Lifecycle<'a> {
             }
         }
 
-        if let Some(pid) = instance.last_pid {
-            if process::force_kill(self.runner, pid) {
-                return Ok(());
+        // Only ever kill a PID that `tasklist` confirmed belongs to a mysqld
+        // process. `pid_live` already rejects a stale PID reused by an
+        // unrelated program, and a plain "reachable" server is not proof that
+        // the recorded PID is still ours.
+        if pid_live {
+            if let Some(pid) = instance.last_pid {
+                if process::force_kill(self.runner, pid) {
+                    return Ok(());
+                }
+                // The kill was attempted and refused: report it instead of
+                // pretending the server stopped, and leave `last_pid` intact so
+                // the operator can still find the process.
+                return Err(AppError::mysql(format!(
+                    "instance `{}` is still running as pid {pid}, which could not be terminated",
+                    instance.name
+                )));
             }
         }
 
@@ -199,7 +212,11 @@ pub fn error_log_hint(datadir: &Path) -> PathBuf {
             .metadata()
             .and_then(|meta| meta.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
-        if newest.as_ref().map(|(time, _)| modified > *time).unwrap_or(true) {
+        if newest
+            .as_ref()
+            .map(|(time, _)| modified > *time)
+            .unwrap_or(true)
+        {
             newest = Some((modified, path));
         }
     }
@@ -233,6 +250,52 @@ mod tests {
 
     fn ini() -> PathBuf {
         PathBuf::from(r"C:\mysql\56\my.ini")
+    }
+
+    #[test]
+    fn start_spawns_mysqld_with_the_instance_option_file() {
+        let runner = FakeRunner::new();
+        runner.push_fail(1, "not running"); // is_reachable before spawn
+        runner.push_ok("mysqld is alive"); // first readiness poll succeeds
+        let mut lifecycle = Lifecycle::new(&runner).with_budget(2, 0.0);
+        let pid = lifecycle
+            .start(&instance(None), &settings(), &ini())
+            .expect("start should succeed once the server answers");
+        assert_eq!(pid, 4243);
+
+        let spawn = &runner.spawns()[0];
+        assert!(
+            spawn.program.ends_with("mysqld.exe"),
+            "got {}",
+            spawn.program
+        );
+        assert_eq!(
+            spawn.args,
+            vec![r"--defaults-file=C:\mysql\56\my.ini".to_string()]
+        );
+    }
+
+    #[test]
+    fn start_kills_the_server_when_it_never_becomes_ready() {
+        let runner = FakeRunner::new();
+        runner.push_fail(1, "not running"); // pre-spawn reachability
+        runner.push_fail(1, "not ready"); // poll 1
+        runner.push_ok("\"mysqld.exe\",\"4243\",\"Console\",\"1\",\"10 K\""); // alive
+        runner.push_fail(1, "not ready"); // poll 2
+        runner.push_ok("\"mysqld.exe\",\"4243\",\"Console\",\"1\",\"10 K\""); // alive
+        runner.push_ok("SUCCESS"); // taskkill on timeout
+        let mut lifecycle = Lifecycle::new(&runner).with_budget(2, 0.0);
+        let error = lifecycle
+            .start(&instance(None), &settings(), &ini())
+            .unwrap_err();
+        assert!(error.to_string().contains("did not become ready"));
+        assert!(
+            runner
+                .invocations()
+                .iter()
+                .any(|item| item.program.contains("taskkill")),
+            "an unready server must be terminated rather than left behind"
+        );
     }
 
     #[test]
@@ -287,6 +350,47 @@ mod tests {
     }
 
     #[test]
+    fn stop_never_kills_a_pid_that_is_not_mysqld() {
+        // The server answers ping but shutdown fails (for example because the
+        // root password is wrong), and the recorded PID now belongs to another
+        // program. Nothing may be killed.
+        let runner = FakeRunner::new();
+        runner.push_ok("mysqld is alive"); // is_reachable
+        runner.push_ok("\"chrome.exe\",\"777\",\"Console\",\"1\",\"10 K\""); // pid NOT mysqld
+        runner.push_fail(1, "shutdown refused"); // mysqladmin shutdown
+        runner.push_ok("mysqld is alive"); // final reachability check
+        let mut lifecycle = Lifecycle::new(&runner).with_budget(1, 0.0);
+        let error = lifecycle
+            .stop(&instance(Some(777)), &settings(), &ini())
+            .unwrap_err();
+        assert!(error.to_string().contains("could not be stopped"));
+        // No taskkill may have been attempted.
+        assert!(
+            !runner
+                .invocations()
+                .iter()
+                .any(|item| item.program.contains("taskkill")),
+            "taskkill must not run for a foreign pid"
+        );
+    }
+
+    #[test]
+    fn stop_reports_failure_when_the_kill_is_refused() {
+        let runner = FakeRunner::new();
+        runner.push_fail(1, "unreachable"); // is_reachable
+        runner.push_ok("\"mysqld.exe\",\"777\",\"Console\",\"1\",\"10 K\""); // pid alive
+        runner.push_fail(128, "Access is denied"); // taskkill refused
+        let mut lifecycle = Lifecycle::new(&runner).with_budget(1, 0.0);
+        let error = lifecycle
+            .stop(&instance(Some(777)), &settings(), &ini())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("could not be terminated"),
+            "a refused kill must not be reported as success: {error}"
+        );
+    }
+
+    #[test]
     fn stop_falls_back_to_killing_the_recorded_pid() {
         // ping fails -> unreachable; tasklist reports the pid alive; shutdown is
         // never attempted because the server is unreachable; taskkill succeeds.
@@ -318,7 +422,9 @@ mod tests {
         runner.push_ok("mysqld is alive");
         let lifecycle = Lifecycle::new(&runner).with_budget(1, 0.0);
         assert_eq!(
-            lifecycle.status(&instance(None), &settings(), &ini()).unwrap(),
+            lifecycle
+                .status(&instance(None), &settings(), &ini())
+                .unwrap(),
             Status::Running
         );
     }
@@ -329,7 +435,9 @@ mod tests {
         runner.push_fail(1, "unreachable");
         let lifecycle = Lifecycle::new(&runner).with_budget(1, 0.0);
         assert_eq!(
-            lifecycle.status(&instance(None), &settings(), &ini()).unwrap(),
+            lifecycle
+                .status(&instance(None), &settings(), &ini())
+                .unwrap(),
             Status::Stopped
         );
     }

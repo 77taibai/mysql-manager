@@ -101,9 +101,8 @@ pub fn parse_mysqld(content: &str) -> MysqldSettings {
 }
 
 pub fn load(ini: &Path) -> Result<MysqldSettings> {
-    let content = std::fs::read_to_string(ini).map_err(|error| {
-        AppError::instance(format!("cannot read {}: {error}", ini.display()))
-    })?;
+    let content = std::fs::read_to_string(ini)
+        .map_err(|error| AppError::instance(format!("cannot read {}: {error}", ini.display())))?;
     Ok(parse_mysqld(&content))
 }
 
@@ -149,7 +148,8 @@ mod tests {
 
     #[test]
     fn handles_whitespace_quotes_and_comments() {
-        let content = "[mysqld]\n  datadir = \"C:/my data\"   # trailing note\n; whole line\nport = '3308'\n";
+        let content =
+            "[mysqld]\n  datadir = \"C:/my data\"   # trailing note\n; whole line\nport = '3308'\n";
         let settings = parse_mysqld(content);
         assert_eq!(settings.datadir.as_deref(), Some("C:/my data"));
         assert_eq!(settings.port, Some(3308));

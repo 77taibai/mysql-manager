@@ -28,6 +28,15 @@ impl CommandOutput {
 pub trait Runner {
     fn run(&self, program: &Path, args: &[String]) -> Result<CommandOutput>;
 
+    /// Runs a program and writes `stdin_data` to its standard input, so SQL
+    /// containing secrets never appears in the process command line.
+    fn run_with_stdin(
+        &self,
+        program: &Path,
+        args: &[String],
+        stdin_data: &str,
+    ) -> Result<CommandOutput>;
+
     /// Starts a server process that outlives this one and returns its PID.
     fn spawn_detached(&self, program: &Path, args: &[String]) -> Result<u32>;
 
@@ -43,6 +52,43 @@ impl Runner for SystemRunner {
     fn run(&self, program: &Path, args: &[String]) -> Result<CommandOutput> {
         let output = Command::new(program).args(args).output().map_err(|error| {
             AppError::mysql(format!("cannot run {}: {error}", program.display()))
+        })?;
+        Ok(CommandOutput {
+            success: output.status.success(),
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    }
+
+    fn run_with_stdin(
+        &self,
+        program: &Path,
+        args: &[String],
+        stdin_data: &str,
+    ) -> Result<CommandOutput> {
+        use std::io::Write;
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                AppError::mysql(format!("cannot run {}: {error}", program.display()))
+            })?;
+
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| AppError::mysql("cannot open stdin for mysql.exe".to_string()))?
+            .write_all(stdin_data.as_bytes())
+            .map_err(|error| {
+                AppError::mysql(format!("cannot send SQL to {}: {error}", program.display()))
+            })?;
+
+        let output = child.wait_with_output().map_err(|error| {
+            AppError::mysql(format!("cannot read {} output: {error}", program.display()))
         })?;
         Ok(CommandOutput {
             success: output.status.success(),
@@ -85,9 +131,9 @@ fn spawn_detached(program: &Path, args: &[String]) -> Result<u32> {
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
-    let child = command.spawn().map_err(|error| {
-        AppError::mysql(format!("cannot start {}: {error}", program.display()))
-    })?;
+    let child = command
+        .spawn()
+        .map_err(|error| AppError::mysql(format!("cannot start {}: {error}", program.display())))?;
     Ok(child.id())
 }
 
@@ -115,11 +161,7 @@ pub fn process_is_alive(runner: &dyn Runner, pid: u32, expected_image: &str) -> 
 
 /// Force-terminates a PID. Returns whether the kill command reported success.
 pub fn force_kill(runner: &dyn Runner, pid: u32) -> bool {
-    let args = vec![
-        "/PID".to_string(),
-        pid.to_string(),
-        "/F".to_string(),
-    ];
+    let args = vec!["/PID".to_string(), pid.to_string(), "/F".to_string()];
     matches!(runner.run(Path::new("taskkill"), &args), Ok(output) if output.success)
 }
 
@@ -149,6 +191,7 @@ pub mod testing {
         spawns: RefCell<Vec<Invocation>>,
         next_pid: RefCell<u32>,
         missing: RefCell<Vec<String>>,
+        stdin: RefCell<Vec<String>>,
     }
 
     impl FakeRunner {
@@ -159,6 +202,7 @@ pub mod testing {
                 spawns: RefCell::new(Vec::new()),
                 next_pid: RefCell::new(4242),
                 missing: RefCell::new(Vec::new()),
+                stdin: RefCell::new(Vec::new()),
             }
         }
 
@@ -174,6 +218,18 @@ pub mod testing {
                 code: Some(0),
                 stdout: stdout.to_string(),
                 stderr: String::new(),
+            }));
+            self
+        }
+
+        /// A successful run whose payload arrives on stderr, as mysqld does for
+        /// `--version` on some builds.
+        pub fn push_ok_stderr(&self, stdout: &str, stderr: &str) -> &Self {
+            self.responses.borrow_mut().push_back(Ok(CommandOutput {
+                success: true,
+                code: Some(0),
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
             }));
             self
         }
@@ -202,6 +258,21 @@ pub mod testing {
                 .cloned()
                 .expect("no invocation was recorded")
         }
+
+        /// Returns everything written to a child's stdin, oldest first.
+        pub fn stdin_writes(&self) -> Vec<String> {
+            self.stdin.borrow().clone()
+        }
+
+        /// Returns every recorded invocation, oldest first.
+        pub fn invocations(&self) -> Vec<Invocation> {
+            self.invocations.borrow().clone()
+        }
+
+        /// Returns every detached spawn request, oldest first.
+        pub fn spawns(&self) -> Vec<Invocation> {
+            self.spawns.borrow().clone()
+        }
     }
 
     impl Runner for FakeRunner {
@@ -229,6 +300,16 @@ pub mod testing {
             let mut pid = self.next_pid.borrow_mut();
             *pid += 1;
             Ok(*pid)
+        }
+
+        fn run_with_stdin(
+            &self,
+            program: &Path,
+            args: &[String],
+            stdin_data: &str,
+        ) -> Result<CommandOutput> {
+            self.stdin.borrow_mut().push(stdin_data.to_string());
+            self.run(program, args)
         }
 
         fn exists(&self, path: &Path) -> bool {

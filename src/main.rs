@@ -114,12 +114,17 @@ enum UserAction {
         #[arg(long)]
         yes: bool,
     },
-    List { name: String },
+    List {
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum DbAction {
-    Add { name: String, database: String },
+    Add {
+        name: String,
+        database: String,
+    },
     Remove {
         name: String,
         database: String,
@@ -127,7 +132,9 @@ enum DbAction {
         #[arg(long)]
         yes: bool,
     },
-    List { name: String },
+    List {
+        name: String,
+    },
 }
 
 fn main() {
@@ -212,7 +219,10 @@ fn run(cli: Cli, runner: &dyn Runner) -> Result<()> {
                 password,
             } => {
                 let host = host.unwrap_or_else(|| commands::default_host().to_string());
-                println!("{}", commands::add_user(&mut ctx, &name, &user, &host, &password)?)
+                println!(
+                    "{}",
+                    commands::add_user(&mut ctx, &name, &user, &host, &password)?
+                )
             }
             UserAction::Remove {
                 name,
@@ -261,7 +271,10 @@ fn run(cli: Cli, runner: &dyn Runner) -> Result<()> {
             host,
         } => {
             let host = host.unwrap_or_else(|| commands::default_host().to_string());
-            println!("{}", commands::bind(&mut ctx, &name, &database, &user, &host)?)
+            println!(
+                "{}",
+                commands::bind(&mut ctx, &name, &database, &user, &host)?
+            )
         }
         Command::Unbind { name, user, host } => {
             let host = host.unwrap_or_else(|| commands::default_host().to_string());

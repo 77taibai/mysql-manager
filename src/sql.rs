@@ -2,7 +2,8 @@ use crate::error::{AppError, Result};
 use rand::Rng;
 
 /// System schemas that the tool refuses to drop.
-pub const PROTECTED_SCHEMAS: [&str; 4] = ["mysql", "information_schema", "performance_schema", "sys"];
+pub const PROTECTED_SCHEMAS: [&str; 4] =
+    ["mysql", "information_schema", "performance_schema", "sys"];
 
 /// Accounts that the tool refuses to drop.
 pub const PROTECTED_USERS: [&str; 3] = ["root", "mysql.sys", "mysql.session"];
@@ -49,10 +50,9 @@ pub fn validate_host(value: &str) -> Result<()> {
     if value.len() > 255 {
         return Err(AppError::usage("the host is too long".to_string()));
     }
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '%' | ':' | '[' | ']'))
-    {
+    if !value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '%' | ':' | '[' | ']')
+    }) {
         return Err(AppError::usage(format!(
             "the host `{value}` contains unsupported characters"
         )));
@@ -111,9 +111,15 @@ pub struct ServerVersion {
 
 impl ServerVersion {
     pub fn parse(text: &str) -> Option<Self> {
-        // Examples: "Ver 5.6.51 for Win64", "Ver 8.0.36-0ubuntu0.22.04.1".
-        let start = text.find(|ch: char| ch.is_ascii_digit())?;
-        let rest = &text[start..];
+        // `mysqld --version` prefixes argv[0], so a path like `D:\mysql8\bin`
+        // would otherwise be mistaken for the version. Anchor on the banner
+        // token when present and only fall back to a bare number otherwise.
+        let candidate = match text.rfind("Ver ") {
+            Some(index) => &text[index + 4..],
+            None => text,
+        };
+        let start = candidate.find(|ch: char| ch.is_ascii_digit())?;
+        let rest = &candidate[start..];
         let token: String = rest
             .chars()
             .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
@@ -137,12 +143,22 @@ impl ServerVersion {
 
     /// `CREATE USER IF NOT EXISTS` exists from 5.7.6 onwards.
     pub fn supports_create_user_if_not_exists(&self) -> bool {
-        *self >= Self { major: 5, minor: 7, patch: 6 }
+        *self
+            >= Self {
+                major: 5,
+                minor: 7,
+                patch: 6,
+            }
     }
 
     /// `utf8mb4` is available from 5.5.3 onwards.
     pub fn supports_utf8mb4(&self) -> bool {
-        *self >= Self { major: 5, minor: 5, patch: 3 }
+        *self
+            >= Self {
+                major: 5,
+                minor: 5,
+                patch: 3,
+            }
     }
 
     /// MySQL 8 defaults to `caching_sha2_password`; older servers must not be
@@ -239,8 +255,15 @@ pub fn bind_sql(database: &str, user: &str, host: &str) -> Result<SqlPlan> {
             "refusing to bind an account to the system database `{database}`"
         )));
     }
+    // Binding revokes global privileges, so applying it to an administrative
+    // account would lock the server out of its own administration.
+    if is_protected_user(user) {
+        return Err(AppError::usage(format!(
+            "refusing to bind the protected account `{user}`"
+        )));
+    }
     let account = account(user, host);
-    let mut statements = vec![
+    let statements = vec![
         // Drop global-level grants first; schema-level revokes below handle the
         // rest. `USAGE` is preserved implicitly because it is not a privilege.
         format!("REVOKE ALL PRIVILEGES, GRANT OPTION FROM {account}"),
@@ -250,7 +273,6 @@ pub fn bind_sql(database: &str, user: &str, host: &str) -> Result<SqlPlan> {
         ),
         "FLUSH PRIVILEGES".to_string(),
     ];
-    statements.shrink_to_fit();
     Ok(SqlPlan::new(statements))
 }
 
@@ -258,6 +280,11 @@ pub fn unbind_sql(database: &str, user: &str, host: &str) -> Result<SqlPlan> {
     validate_schema_name(database)?;
     validate_user_name(user)?;
     validate_host(host)?;
+    if is_protected_user(user) {
+        return Err(AppError::usage(format!(
+            "refusing to unbind the protected account `{user}`"
+        )));
+    }
     Ok(SqlPlan::new(vec![
         format!(
             "REVOKE ALL PRIVILEGES ON {}.* FROM {}",
@@ -323,9 +350,8 @@ pub fn random_user_name() -> String {
 /// one lowercase letter, one digit and one symbol, then shuffles the result.
 pub fn random_password() -> String {
     let mut rng = rand::rng();
-    let pick = |rng: &mut rand::rngs::ThreadRng, set: &[u8]| {
-        set[rng.random_range(0..set.len())] as char
-    };
+    let pick =
+        |rng: &mut rand::rngs::ThreadRng, set: &[u8]| set[rng.random_range(0..set.len())] as char;
 
     let mut chars: Vec<char> = vec![
         pick(&mut rng, UPPER),
@@ -349,9 +375,21 @@ pub fn random_password() -> String {
 mod tests {
     use super::*;
 
-    const V56: ServerVersion = ServerVersion { major: 5, minor: 6, patch: 51 };
-    const V57: ServerVersion = ServerVersion { major: 5, minor: 7, patch: 44 };
-    const V80: ServerVersion = ServerVersion { major: 8, minor: 0, patch: 36 };
+    const V56: ServerVersion = ServerVersion {
+        major: 5,
+        minor: 6,
+        patch: 51,
+    };
+    const V57: ServerVersion = ServerVersion {
+        major: 5,
+        minor: 7,
+        patch: 44,
+    };
+    const V80: ServerVersion = ServerVersion {
+        major: 8,
+        minor: 0,
+        patch: 36,
+    };
 
     #[test]
     fn parses_real_version_banners() {
@@ -365,18 +403,59 @@ mod tests {
     }
 
     #[test]
+    fn digits_in_the_executable_path_do_not_override_the_banner_version() {
+        // `mysqld --version` prints argv[0] first, so a path like `mysql8` must
+        // not be mistaken for the server version.
+        let banner = r"D:\mysql8\bin\mysqld.exe  Ver 5.6.51 for Win64 on x86_64";
+        assert_eq!(ServerVersion::parse(banner), Some(V56));
+
+        let spaces =
+            r"C:\Program Files\MySQL\MySQL Server 5.7\bin\mysqld.exe  Ver 5.7.44 for Win64";
+        assert_eq!(
+            ServerVersion::parse(spaces),
+            Some(ServerVersion {
+                major: 5,
+                minor: 7,
+                patch: 44
+            })
+        );
+    }
+
+    #[test]
+    fn a_digit_bearing_path_would_have_chosen_the_wrong_sql_dialect() {
+        // Guards the regression directly: parsing this banner must not yield 8.x,
+        // which would emit `IDENTIFIED WITH mysql_native_password` on a 5.6 server.
+        let version =
+            ServerVersion::parse(r"D:\mysql8\bin\mysqld.exe  Ver 5.6.51 for Win64").unwrap();
+        assert_eq!(version.major, 5);
+        let plan = create_user_sql(version, "app", "localhost", "pw").unwrap();
+        assert_eq!(
+            plan.statements,
+            vec!["CREATE USER 'app'@'localhost' IDENTIFIED BY 'pw'"]
+        );
+    }
+
+    #[test]
     fn version_capabilities_follow_the_documented_boundaries() {
         assert!(!V56.supports_create_user_if_not_exists());
         assert!(V57.supports_create_user_if_not_exists());
         assert!(V80.supports_create_user_if_not_exists());
         assert!(V56.supports_utf8mb4());
-        assert!(!ServerVersion { major: 5, minor: 5, patch: 2 }.supports_utf8mb4());
+        assert!(!ServerVersion {
+            major: 5,
+            minor: 5,
+            patch: 2
+        }
+        .supports_utf8mb4());
     }
 
     #[test]
     fn create_user_differs_between_56_and_80() {
         let old = create_user_sql(V56, "app", "localhost", "pw").unwrap();
-        assert_eq!(old.statements, vec!["CREATE USER 'app'@'localhost' IDENTIFIED BY 'pw'"]);
+        assert_eq!(
+            old.statements,
+            vec!["CREATE USER 'app'@'localhost' IDENTIFIED BY 'pw'"]
+        );
 
         let new = create_user_sql(V80, "app", "localhost", "pw").unwrap();
         assert_eq!(
@@ -424,11 +503,27 @@ mod tests {
     }
 
     #[test]
+    fn binding_or_unbinding_a_protected_account_is_refused() {
+        // Binding revokes global privileges, so it would strip root's ability to
+        // administer the server.
+        assert!(bind_sql("appdb", "root", "localhost").is_err());
+        assert!(unbind_sql("appdb", "ROOT", "localhost").is_err());
+        assert!(bind_sql("appdb", "app", "localhost").is_ok());
+    }
+
+    #[test]
     fn database_charset_depends_on_version() {
         assert!(create_database_sql(V56, "appdb").unwrap().statements[0].contains("utf8mb4"));
-        assert!(create_database_sql(ServerVersion { major: 5, minor: 1, patch: 0 }, "appdb")
-            .unwrap()
-            .statements[0]
+        assert!(create_database_sql(
+            ServerVersion {
+                major: 5,
+                minor: 1,
+                patch: 0
+            },
+            "appdb"
+        )
+        .unwrap()
+        .statements[0]
             .contains("CHARACTER SET utf8"));
     }
 
@@ -439,7 +534,10 @@ mod tests {
             Some("appdb".to_string())
         );
         // `ON *.*` is a global privilege and names no single schema.
-        assert_eq!(schema_from_grant_line("GRANT USAGE ON *.* TO 'app'@'localhost'"), None);
+        assert_eq!(
+            schema_from_grant_line("GRANT USAGE ON *.* TO 'app'@'localhost'"),
+            None
+        );
         assert_eq!(
             schema_from_grant_line("GRANT SELECT ON `other`.* TO 'app'@'localhost'"),
             Some("other".to_string())
