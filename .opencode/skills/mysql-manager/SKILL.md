@@ -43,6 +43,7 @@ mm status [name]                   # lists all when name is omitted
 # Databases
 mm db add <name> <db>
 mm db remove <name> <db> [--yes]
+mm db clear <name> <db> [--yes]     # empty the schema, keep its name and credentials
 mm db list <name>
 
 # Users (host defaults to localhost)
@@ -53,6 +54,9 @@ mm user list <name>
 # Exclusive one-to-one binding
 mm bind <name> <db> <user> [--host <host>]
 mm unbind <name> <user> [--host <host>]
+
+# Wipe the instance back to a fresh state
+mm reset <name> [--yes]            # drops every user database and account
 
 # One-click test workflow
 mm workflow [name]                 # interactively picks an instance when name is omitted
@@ -108,6 +112,20 @@ mm workflows remove 2             # also drops the real database and user
 - **Protected objects**: the system databases `mysql`, `information_schema`,
   `performance_schema`, `sys` and the accounts `root`, `mysql.sys`,
   `mysql.session` cannot be dropped or bound (exit code 2).
+- **`mm db clear` empties a schema without dropping it.** Tables, views,
+  procedures/functions and events are removed; the database itself, its charset,
+  the accounts and their grants all stay, so credentials a `workflow` run printed
+  keep working. Use it to reuse one test database repeatedly. Foreign keys do not
+  block it (`FOREIGN_KEY_CHECKS` is toggled off, then restored). It re-reads the
+  schema afterwards and fails rather than claiming success if anything survived.
+  System schemas are refused; a missing schema is rejected before any DDL runs.
+- **`mm reset` is a one-way wipe.** It drops every non-system database and every
+  non-system account (anything not `root`/`mysql.*`), then clears that instance's
+  bindings and workflow records from `config.toml`. The four system schemas and
+  the shipped accounts are kept — removing them would break the instance rather
+  than reset it. The server must be running. Confirmation requires retyping the
+  instance name; pass `--yes` in scripts. The output lists exactly what was
+  dropped and what was kept.
 - **`db remove` / `user remove` ask for confirmation by default** (type the name);
   add `--yes` in scripts to skip.
 - **`workflows remove` drops the user before the database**; the order must not

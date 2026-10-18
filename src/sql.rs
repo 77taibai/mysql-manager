@@ -5,8 +5,9 @@ use rand::Rng;
 pub const PROTECTED_SCHEMAS: [&str; 4] =
     ["mysql", "information_schema", "performance_schema", "sys"];
 
-/// Accounts that the tool refuses to drop.
-pub const PROTECTED_USERS: [&str; 3] = ["root", "mysql.sys", "mysql.session"];
+/// Accounts that MySQL ships with. Dropping them would leave the server
+/// unusable or unadministrable, so the tool refuses to remove them.
+pub const PROTECTED_USERS: [&str; 4] = ["root", "mysql.sys", "mysql.session", "mysql.infoschema"];
 
 pub const MAX_IDENTIFIER_LEN: usize = 64;
 
@@ -70,6 +71,14 @@ pub fn is_protected_user(value: &str) -> bool {
         .any(|item| item.eq_ignore_ascii_case(value))
 }
 
+/// Accounts the server itself depends on. Besides the known names, MySQL 8.0
+/// reserves the whole `mysql.` namespace, so a wipe keeps that prefix too:
+/// removing an account the server needs would break the instance instead of
+/// resetting it.
+pub fn is_reserved_account(value: &str) -> bool {
+    is_protected_user(value) || value.to_ascii_lowercase().starts_with("mysql.")
+}
+
 /// Quotes a string literal for MySQL, escaping backslashes and single quotes.
 pub fn quote_literal(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len() + 2);
@@ -94,9 +103,94 @@ pub fn quote_ident(value: &str) -> String {
     format!("`{value}`")
 }
 
+/// Quotes an identifier that came from the server rather than from typed input.
+///
+/// MySQL allows almost anything in an object name, including spaces, dots and
+/// backticks, so such a name must not be treated as pre-validated. A backtick is
+/// doubled (the only escape MySQL recognises inside a quoted identifier) and a
+/// NUL byte is refused outright.
+pub fn quote_server_ident(value: &str) -> Result<String> {
+    if value.is_empty() {
+        return Err(AppError::usage("对象名称不能为空".to_string()));
+    }
+    if value.contains('\0') {
+        return Err(AppError::usage(format!(
+            "对象名称 `{}` 含有非法字符",
+            value.escape_default()
+        )));
+    }
+    Ok(format!("`{}`", value.replace('`', "``")))
+}
+
+/// The kind of stored routine, which decides the keyword used to drop it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineKind {
+    Procedure,
+    Function,
+}
+
+impl RoutineKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("PROCEDURE") {
+            Some(Self::Procedure)
+        } else if value.eq_ignore_ascii_case("FUNCTION") {
+            Some(Self::Function)
+        } else {
+            None
+        }
+    }
+
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            Self::Procedure => "PROCEDURE",
+            Self::Function => "FUNCTION",
+        }
+    }
+}
+
+/// A stored routine read from `information_schema.ROUTINES`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Routine {
+    pub name: String,
+    pub kind: RoutineKind,
+}
+
+/// Everything inside one schema that a "clear the contents" operation removes.
+///
+/// Triggers are absent on purpose: a trigger belongs to a table and is dropped
+/// together with it, so listing them separately would only produce statements
+/// that fail after their table is gone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaObjects {
+    pub views: Vec<String>,
+    pub tables: Vec<String>,
+    pub routines: Vec<Routine>,
+    pub events: Vec<String>,
+}
+
+impl SchemaObjects {
+    pub fn is_empty(&self) -> bool {
+        self.views.is_empty()
+            && self.tables.is_empty()
+            && self.routines.is_empty()
+            && self.events.is_empty()
+    }
+}
+
 /// Wraps a validated user/host pair.
 pub fn account(user: &str, host: &str) -> String {
     format!("{}@{}", quote_literal(user), quote_literal(host))
+}
+
+/// Human-readable form of an account, naming the anonymous cases instead of
+/// printing a bare `@` that looks like a bug in the report.
+pub fn describe_account(user: &str, host: &str) -> String {
+    match (user.is_empty(), host.is_empty()) {
+        (false, false) => format!("{user}@{host}"),
+        (true, false) => format!("<匿名>@{host}"),
+        (false, true) => format!("{user}@<任意主机>"),
+        (true, true) => "<匿名>@<任意主机>".to_string(),
+    }
 }
 
 /// Server capability derived from `mysqld --version`.
@@ -295,6 +389,118 @@ pub fn unbind_sql(database: &str, user: &str, host: &str) -> Result<SqlPlan> {
         ),
         "FLUSH PRIVILEGES".to_string(),
     ]))
+}
+
+/// Builds the statements that empty one schema while leaving the schema itself
+/// and every account/privilege untouched.
+///
+/// The database is never dropped, so its name, owner and the grants that
+/// reference it stay exactly as they were: the credentials a workflow handed
+/// out keep working after a clear.
+///
+/// Ordering matters:
+/// - `FOREIGN_KEY_CHECKS` is disabled so parent/child tables can be dropped in
+///   any order; it is restored in the same script, and a failure aborts before
+///   the restore only within the same rejected batch.
+/// - views go before tables, because a view can depend on a table.
+/// - tables go before routines and events: a routine or event body is not
+///   checked against the tables it references, but dropping the tables first
+///   keeps the script readable in the order a reader expects.
+pub fn clear_schema_sql(schema: &str, objects: &SchemaObjects) -> Result<SqlPlan> {
+    validate_schema_name(schema)?;
+    if is_protected_schema(schema) {
+        return Err(AppError::usage(format!("拒绝清空系统数据库 `{schema}`")));
+    }
+    if objects.is_empty() {
+        return Ok(SqlPlan::new(Vec::new()));
+    }
+
+    let mut statements = vec!["SET FOREIGN_KEY_CHECKS = 0".to_string()];
+    for view in &objects.views {
+        statements.push(format!(
+            "DROP VIEW IF EXISTS {}.{}",
+            quote_ident(schema),
+            quote_server_ident(view)?
+        ));
+    }
+    for table in &objects.tables {
+        statements.push(format!(
+            "DROP TABLE IF EXISTS {}.{}",
+            quote_ident(schema),
+            quote_server_ident(table)?
+        ));
+    }
+    for routine in &objects.routines {
+        statements.push(format!(
+            "DROP {} IF EXISTS {}.{}",
+            routine.kind.keyword(),
+            quote_ident(schema),
+            quote_server_ident(&routine.name)?
+        ));
+    }
+    for event in &objects.events {
+        statements.push(format!(
+            "DROP EVENT IF EXISTS {}.{}",
+            quote_ident(schema),
+            quote_server_ident(event)?
+        ));
+    }
+    statements.push("SET FOREIGN_KEY_CHECKS = 1".to_string());
+    Ok(SqlPlan::new(statements))
+}
+
+/// Drops every non-system schema, leaving the server's own schemas untouched.
+///
+/// `IF EXISTS` keeps the script tolerant of a schema vanishing between the
+/// listing query and the drop, which is exactly the race a wipe would
+/// otherwise fail on.
+pub fn drop_user_schemas_sql(schemas: &[String]) -> Result<SqlPlan> {
+    let mut statements = Vec::new();
+    for schema in schemas {
+        validate_schema_name(schema)?;
+        if is_protected_schema(schema) {
+            continue;
+        }
+        statements.push(format!("DROP DATABASE IF EXISTS {}", quote_ident(schema)));
+    }
+    Ok(SqlPlan::new(statements))
+}
+
+/// Drops every account that the server does not ship with.
+///
+/// The names come from `mysql.user` rather than from the user, and a legitimate
+/// account may have an empty user name (anonymous account) or an empty host, so
+/// the wipe path accepts empties that `validate_identifier` rejects for typed
+/// input. Everything else is checked the same way, and the values are escaped
+/// as literals, so a hostile name still cannot alter the script.
+pub fn drop_user_accounts_sql(accounts: &[(String, String)]) -> Result<SqlPlan> {
+    let mut statements = Vec::new();
+    for (user, host) in accounts {
+        if is_reserved_account(user) {
+            continue;
+        }
+        validate_account_part("用户", user)?;
+        validate_account_part("主机", host)?;
+        statements.push(format!("DROP USER {}", account(user, host)));
+    }
+    Ok(SqlPlan::new(statements))
+}
+
+/// Validates a `mysql.user` column value that may legitimately be empty, which
+/// is how MySQL represents an anonymous account or a wildcard-less host.
+fn validate_account_part(kind: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.len() > 255 {
+        return Err(AppError::usage(format!("{kind}过长")));
+    }
+    if !value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '%' | ':' | '[' | ']' | '$')
+    }) {
+        return Err(AppError::usage(format!("{kind} `{value}` 含不支持的字符")));
+    }
+    Ok(())
 }
 
 /// Parses the `ON \`db\`.*` portion of a `SHOW GRANTS` line so the caller can
@@ -605,9 +811,212 @@ mod tests {
     }
 
     #[test]
+    fn a_clear_empties_one_schema_without_dropping_it() {
+        let objects = SchemaObjects {
+            views: vec!["v_summary".to_string()],
+            tables: vec!["orders".to_string(), "users".to_string()],
+            routines: vec![Routine {
+                name: "recalc".to_string(),
+                kind: RoutineKind::Procedure,
+            }],
+            events: vec!["nightly".to_string()],
+        };
+        let plan = clear_schema_sql("appdb", &objects).unwrap();
+        assert_eq!(
+            plan.statements,
+            vec![
+                "SET FOREIGN_KEY_CHECKS = 0",
+                "DROP VIEW IF EXISTS `appdb`.`v_summary`",
+                "DROP TABLE IF EXISTS `appdb`.`orders`",
+                "DROP TABLE IF EXISTS `appdb`.`users`",
+                "DROP PROCEDURE IF EXISTS `appdb`.`recalc`",
+                "DROP EVENT IF EXISTS `appdb`.`nightly`",
+                "SET FOREIGN_KEY_CHECKS = 1",
+            ]
+        );
+        // The schema itself must never be dropped: that would take the name and
+        // the grants with it.
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|sql| sql.contains("DROP DATABASE")),
+            "a clear must never drop the database: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_clear_drops_views_before_tables() {
+        // A view may depend on a table, so the reverse order can fail.
+        let objects = SchemaObjects {
+            views: vec!["v".to_string()],
+            tables: vec!["t".to_string()],
+            ..SchemaObjects::default()
+        };
+        let plan = clear_schema_sql("appdb", &objects).unwrap();
+        let view_at = plan
+            .statements
+            .iter()
+            .position(|sql| sql.contains("DROP VIEW"))
+            .unwrap();
+        let table_at = plan
+            .statements
+            .iter()
+            .position(|sql| sql.contains("DROP TABLE"))
+            .unwrap();
+        assert!(view_at < table_at, "views must go first: {plan:?}");
+    }
+
+    #[test]
+    fn a_clear_on_an_empty_schema_issues_no_statements() {
+        let plan = clear_schema_sql("appdb", &SchemaObjects::default()).unwrap();
+        assert!(plan.statements.is_empty());
+    }
+
+    #[test]
+    fn a_clear_refuses_a_system_schema() {
+        let objects = SchemaObjects {
+            tables: vec!["user".to_string()],
+            ..SchemaObjects::default()
+        };
+        let error = clear_schema_sql("mysql", &objects).unwrap_err();
+        assert!(error.to_string().contains("系统数据库"));
+        assert!(clear_schema_sql("information_schema", &objects).is_err());
+    }
+
+    #[test]
+    fn a_clear_escapes_object_names_taken_from_the_server() {
+        // Object names come from information_schema and may contain backticks,
+        // which must be doubled rather than closing the identifier early.
+        let objects = SchemaObjects {
+            tables: vec!["we`ird".to_string()],
+            ..SchemaObjects::default()
+        };
+        let plan = clear_schema_sql("appdb", &objects).unwrap();
+        assert!(
+            plan.statements
+                .iter()
+                .any(|sql| sql == "DROP TABLE IF EXISTS `appdb`.`we``ird`"),
+            "got: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_clear_rejects_an_object_name_containing_a_nul_byte() {
+        let objects = SchemaObjects {
+            tables: vec!["bad\0name".to_string()],
+            ..SchemaObjects::default()
+        };
+        assert!(clear_schema_sql("appdb", &objects).is_err());
+    }
+
+    #[test]
+    fn routine_kinds_round_trip_through_the_catalog_spelling() {
+        assert_eq!(
+            RoutineKind::parse("PROCEDURE"),
+            Some(RoutineKind::Procedure)
+        );
+        assert_eq!(RoutineKind::parse("function"), Some(RoutineKind::Function));
+        assert_eq!(RoutineKind::parse("TRIGGER"), None);
+        assert_eq!(RoutineKind::Procedure.keyword(), "PROCEDURE");
+        assert_eq!(RoutineKind::Function.keyword(), "FUNCTION");
+    }
+
+    #[test]
     fn protected_users_are_detected_case_insensitively() {
         assert!(is_protected_user("ROOT"));
         assert!(is_protected_user("mysql.sys"));
         assert!(!is_protected_user("app"));
+    }
+
+    #[test]
+    fn the_mysql_internal_namespace_is_reserved() {
+        // MySQL 8.0 reserves every `mysql.` account; dropping one breaks the
+        // server rather than resetting it.
+        assert!(is_reserved_account("mysql.sys"));
+        assert!(is_reserved_account("mysql.session"));
+        assert!(is_reserved_account("mysql.infoschema"));
+        assert!(is_reserved_account("ROOT"));
+        assert!(!is_reserved_account("app"));
+        assert!(!is_reserved_account("mysqluser"));
+    }
+
+    #[test]
+    fn a_wipe_drops_user_schemas_but_never_system_ones() {
+        let schemas = vec![
+            "mysql".to_string(),
+            "appdb".to_string(),
+            "information_schema".to_string(),
+            "other_db".to_string(),
+            "sys".to_string(),
+            "performance_schema".to_string(),
+        ];
+        let plan = drop_user_schemas_sql(&schemas).unwrap();
+        assert_eq!(
+            plan.statements,
+            vec![
+                "DROP DATABASE IF EXISTS `appdb`",
+                "DROP DATABASE IF EXISTS `other_db`",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wipe_drops_user_accounts_but_keeps_system_ones() {
+        let accounts = vec![
+            ("root".to_string(), "localhost".to_string()),
+            ("app".to_string(), "localhost".to_string()),
+            ("mysql.sys".to_string(), "localhost".to_string()),
+            ("remote".to_string(), "%".to_string()),
+        ];
+        let plan = drop_user_accounts_sql(&accounts).unwrap();
+        assert_eq!(
+            plan.statements,
+            vec!["DROP USER 'app'@'localhost'", "DROP USER 'remote'@'%'",]
+        );
+    }
+
+    #[test]
+    fn a_wipe_removes_anonymous_accounts() {
+        // MySQL 5.6 ships anonymous accounts, and a wipe that leaves them behind
+        // has not reset the server. They must be droppable even though their
+        // user name is empty.
+        let accounts = vec![
+            (String::new(), String::new()),
+            (String::new(), "localhost".to_string()),
+            ("root".to_string(), "localhost".to_string()),
+        ];
+        let plan = drop_user_accounts_sql(&accounts).unwrap();
+        assert_eq!(
+            plan.statements,
+            vec!["DROP USER ''@''", "DROP USER ''@'localhost'"]
+        );
+    }
+
+    #[test]
+    fn anonymous_accounts_are_named_in_reports() {
+        assert_eq!(describe_account("app", "localhost"), "app@localhost");
+        assert_eq!(describe_account("", "localhost"), "<匿名>@localhost");
+        assert_eq!(describe_account("", ""), "<匿名>@<任意主机>");
+    }
+
+    #[test]
+    fn a_wipe_on_a_pristine_server_issues_no_statements() {
+        let plan = drop_user_schemas_sql(&["mysql".to_string(), "sys".to_string()]).unwrap();
+        assert!(plan.statements.is_empty());
+        let plan =
+            drop_user_accounts_sql(&[("root".to_string(), "localhost".to_string())]).unwrap();
+        assert!(plan.statements.is_empty());
+    }
+
+    #[test]
+    fn a_wipe_refuses_a_schema_name_that_would_break_the_script() {
+        // The names come from the server, but an unexpected value must still
+        // fail before it is interpolated into SQL.
+        let error = drop_user_schemas_sql(&["bad name".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("不支持的字符"));
+        let error = drop_user_accounts_sql(&[("bad'user".to_string(), "localhost".to_string())])
+            .unwrap_err();
+        assert!(error.to_string().contains("不支持的字符"));
     }
 }

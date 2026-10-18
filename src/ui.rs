@@ -106,6 +106,8 @@ pub fn run_menu(ctx: &mut Ctx<'_>) -> Result<()> {
         println!("  7) 一键测试工作流");
         println!("  8) 查看 workflow 记录");
         println!("  9) 删除 workflow 记录");
+        println!("  c) 清空指定库（保留库名与账号）");
+        println!("  r) 清空实例数据库");
         println!("  0) 退出");
 
         let input = match read_line("\n请选择：")? {
@@ -154,6 +156,14 @@ pub fn run_menu(ctx: &mut Ctx<'_>) -> Result<()> {
             }
             "9" => match run_remove_workflow(ctx) {
                 Ok(message) => println!("{message}"),
+                Err(error) => eprintln!("错误：{error}"),
+            },
+            other if other.eq_ignore_ascii_case("c") => match run_clear_database(ctx) {
+                Ok(()) => {}
+                Err(error) => eprintln!("错误：{error}"),
+            },
+            other if other.eq_ignore_ascii_case("r") => match run_reset(ctx) {
+                Ok(()) => {}
                 Err(error) => eprintln!("错误：{error}"),
             },
             other => println!("无效的选项：{other}"),
@@ -224,6 +234,61 @@ fn run_remove_workflow(ctx: &mut Ctx<'_>) -> Result<String> {
 fn run_stop(ctx: &mut Ctx<'_>) -> Result<String> {
     let name = pick_instance(ctx)?;
     commands::stop_instance(ctx, &name)
+}
+
+fn run_clear_database(ctx: &mut Ctx<'_>) -> Result<()> {
+    let name = pick_instance(ctx)?;
+    let databases = commands::list_databases(ctx, &name)?;
+    if databases.is_empty() {
+        return Err(AppError::usage(format!("`{name}` 上没有任何数据库可清空")));
+    }
+    // Only offer the schemas a clear is allowed to touch, so the user cannot
+    // pick a system schema and then be told it is refused.
+    let choices: Vec<String> = databases
+        .into_iter()
+        .filter(|item| !crate::sql::is_protected_schema(item))
+        .collect();
+    if choices.is_empty() {
+        return Err(AppError::usage(format!(
+            "`{name}` 上只有系统数据库，没有可清空的库"
+        )));
+    }
+    let index = choose("请选择要清空的数据库", &choices)?;
+    let database = choices[index].clone();
+    if !ask_clear_confirmation(&database)? {
+        println!("已取消。");
+        return Ok(());
+    }
+    let outcome = commands::clear_database(ctx, &name, &database)?;
+    println!("{}", commands::describe_clear(&outcome));
+    Ok(())
+}
+
+fn run_reset(ctx: &mut Ctx<'_>) -> Result<()> {
+    let name = pick_instance(ctx)?;
+    if !ask_reset_confirmation(ctx, &name)? {
+        println!("已取消。");
+        return Ok(());
+    }
+    let outcome = commands::reset_instance(ctx, &name)?;
+    println!("{}", commands::describe_reset(&outcome));
+    Ok(())
+}
+
+/// A wipe cannot be undone, so it is confirmed by retyping the instance name
+/// rather than by a single keystroke. The instance is not contacted here: the
+/// prompt must work even when the server is down, and listing what would be
+/// deleted would require it to be up.
+pub fn ask_reset_confirmation(ctx: &Ctx<'_>, name: &str) -> Result<bool> {
+    // Reject an unknown instance before asking, so the prompt cannot be
+    // answered for something that will then fail.
+    ctx.config.require(name)?;
+    println!();
+    println!("警告：这将删除实例 `{name}` 上的所有数据库与账号，操作不可撤销。");
+    println!("  保留：mysql / information_schema / performance_schema / sys 及系统账号");
+    println!("  清除：其余全部数据库与账号，以及本工具记录的绑定与 workflow 记录");
+    let answer = require_line(&format!("确认请输入实例名 `{name}`："))?;
+    Ok(answer.trim() == name)
 }
 
 fn run_create_database(ctx: &mut Ctx<'_>) -> Result<String> {
@@ -307,4 +372,14 @@ pub fn pick_instance_for_workflow(ctx: &Ctx<'_>) -> Result<String> {
 
 pub fn ask_drop_confirmation(kind: &str, name: &str) -> Result<bool> {
     confirm(&format!("确定要永久删除{kind} `{name}` 吗？"))
+}
+
+/// A clear is destructive but reversible in a different sense than a drop: the
+/// schema and its credentials survive, so a single `y` is enough. The prompt
+/// still spells out that the data inside is gone for good.
+pub fn ask_clear_confirmation(database: &str) -> Result<bool> {
+    println!();
+    println!("将删除 `{database}` 内的全部表、视图、存储对象与事件。");
+    println!("  保留：数据库本身、账号与密码、授权关系");
+    confirm("确定要清空吗？")
 }

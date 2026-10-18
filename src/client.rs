@@ -122,7 +122,12 @@ impl<'a> MysqlClient<'a> {
                 detail
             }));
         }
-        Ok(output.stdout.trim().to_string())
+        // Only the trailing line terminator is stripped. Trimming the whole
+        // payload would also eat leading/trailing spaces and tabs, which are
+        // real column values: an anonymous account's row is a single tab, and
+        // trimming turned it into an empty line that `query()` then discarded,
+        // so the account silently survived a wipe.
+        Ok(output.stdout.trim_end_matches(['\r', '\n']).to_string())
     }
 
     /// Runs a query as root and returns the rows, one per line.
@@ -131,6 +136,8 @@ impl<'a> MysqlClient<'a> {
         Ok(raw
             .lines()
             .map(|line| line.trim_end_matches('\r').to_string())
+            // Drop only genuinely empty lines (the artefact of a trailing
+            // newline), never a row that happens to be all whitespace.
             .filter(|line| !line.is_empty())
             .collect())
     }
@@ -236,9 +243,82 @@ impl<'a> MysqlClient<'a> {
         self.query("SELECT CONCAT(User, '@', Host) FROM mysql.user")
     }
 
+    /// Lists existing accounts as separate user/host pairs.
+    ///
+    /// `--batch` separates columns with a tab and escapes any tab inside a
+    /// value as `\t`, so splitting on the first real tab is unambiguous. A
+    /// combined `User@Host` string would not be: an anonymous account has an
+    /// empty user name, and a host may contain characters that make
+    /// re-splitting the joined text guesswork.
+    pub fn existing_account_pairs(&self) -> Result<Vec<(String, String)>> {
+        let rows = self.query("SELECT User, Host FROM mysql.user")?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let (user, host) = row.split_once('\t')?;
+                Some((user.to_string(), host.to_string()))
+            })
+            .collect())
+    }
+
     /// Lists existing schema names.
     pub fn existing_schemas(&self) -> Result<Vec<String>> {
         self.query("SHOW DATABASES")
+    }
+
+    /// Lists the objects inside one schema that a "clear contents" operation
+    /// would remove.
+    ///
+    /// `information_schema` is used rather than `SHOW` statements so views,
+    /// tables, routines and events come back in a single round trip and in a
+    /// shape that cannot be confused with each other: `SHOW TABLES` alone
+    /// returns views and base tables together.
+    pub fn schema_objects(&self, schema: &str) -> Result<crate::sql::SchemaObjects> {
+        let literal = crate::sql::quote_literal(schema);
+
+        let views = self.query(&format!(
+            "SELECT TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA = {literal}"
+        ))?;
+        // BASE TABLE excludes views, so the two lists never overlap.
+        let tables = self.query(&format!(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = {literal} AND TABLE_TYPE = 'BASE TABLE'"
+        ))?;
+        let routine_rows = self.query(&format!(
+            "SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES \
+             WHERE ROUTINE_SCHEMA = {literal}"
+        ))?;
+        let events = self.query(&format!(
+            "SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA = {literal}"
+        ))?;
+
+        // A routine row whose type is neither PROCEDURE nor FUNCTION cannot be
+        // dropped with a known keyword. Failing loudly beats silently leaving it
+        // behind, which would make "cleared" untrue.
+        let mut routines = Vec::new();
+        for row in routine_rows {
+            let (name, kind) = row.split_once('\t').ok_or_else(|| {
+                AppError::mysql(format!(
+                    "无法解析 `{schema}` 上的存储过程信息：`{row}` 缺少列分隔符"
+                ))
+            })?;
+            let kind = crate::sql::RoutineKind::parse(kind).ok_or_else(|| {
+                AppError::mysql(format!(
+                    "`{schema}` 上的存储对象 `{name}` 类型为 `{kind}`，无法确定删除语句"
+                ))
+            })?;
+            routines.push(crate::sql::Routine {
+                name: name.to_string(),
+                kind,
+            });
+        }
+
+        Ok(crate::sql::SchemaObjects {
+            views,
+            tables,
+            routines,
+            events,
+        })
     }
 }
 
@@ -429,6 +509,23 @@ mod tests {
     }
 
     #[test]
+    fn a_row_that_is_only_a_separator_is_not_dropped_as_blank() {
+        // Regression: the anonymous `''@''` account renders as a single tab.
+        // Trimming the whole payload turned it into an empty line, so `query()`
+        // discarded it and the account survived a wipe.
+        let runner = FakeRunner::new();
+        runner.push_ok("root\tlocalhost\n\t\n");
+        let inst = instance();
+        let ini_path = ini();
+        let cfg = settings();
+        let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
+        assert_eq!(
+            client.query("SELECT User, Host FROM mysql.user").unwrap(),
+            vec!["root\tlocalhost", "\t"]
+        );
+    }
+
+    #[test]
     fn version_detection_uses_mysqld_version_output() {
         let runner = FakeRunner::new();
         runner.push_ok("C:\\mysql\\bin\\mysqld.exe  Ver 5.6.51 for Win64 on x86_64");
@@ -479,5 +576,138 @@ mod tests {
         let error = client.verify_account("u_x", "pw", "db_x").unwrap_err();
         assert!(error.to_string().contains("无法连接到"));
         assert!(error.to_string().contains("ERROR 1045"));
+    }
+
+    #[test]
+    fn account_pairs_split_user_and_host_on_the_column_separator() {
+        // `--batch` separates columns with a tab, and a host can be `%` or an
+        // IP, so the two values must not be split on `@`.
+        let runner = FakeRunner::new();
+        runner.push_ok("root\tlocalhost\napp\t%\n");
+        let inst = instance();
+        let ini_path = ini();
+        let cfg = settings();
+        let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
+        assert_eq!(
+            client.existing_account_pairs().unwrap(),
+            vec![
+                ("root".to_string(), "localhost".to_string()),
+                ("app".to_string(), "%".to_string()),
+            ]
+        );
+        assert!(
+            runner.last().args.join(" ").contains("--batch"),
+            "pairs must be read from machine-readable output"
+        );
+    }
+
+    #[test]
+    fn account_pairs_keep_anonymous_rows() {
+        // An empty user name is a legitimate anonymous account, not a malformed
+        // row: dropping it is part of restoring a pristine server.
+        let runner = FakeRunner::new();
+        runner.push_ok("root\tlocalhost\n\t\n\tlocalhost\n");
+        let inst = instance();
+        let ini_path = ini();
+        let cfg = settings();
+        let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
+        assert_eq!(
+            client.existing_account_pairs().unwrap(),
+            vec![
+                ("root".to_string(), "localhost".to_string()),
+                (String::new(), String::new()),
+                (String::new(), "localhost".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn account_pairs_drop_rows_without_a_column_separator() {
+        let runner = FakeRunner::new();
+        runner.push_ok("root\tlocalhost\ngarbage\n");
+        let inst = instance();
+        let ini_path = ini();
+        let cfg = settings();
+        let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
+        assert_eq!(
+            client.existing_account_pairs().unwrap(),
+            vec![("root".to_string(), "localhost".to_string())]
+        );
+    }
+
+    #[test]
+    fn schema_objects_reads_views_tables_routines_and_events() {
+        let runner = FakeRunner::new();
+        runner.push_ok("v_summary"); // VIEWS
+        runner.push_ok("orders\nusers"); // TABLES (BASE TABLE only)
+        runner.push_ok("recalc\tPROCEDURE\ntotal\tFUNCTION"); // ROUTINES
+        runner.push_ok("nightly"); // EVENTS
+        let inst = instance();
+        let ini_path = ini();
+        let cfg = settings();
+        let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
+
+        let objects = client.schema_objects("appdb").unwrap();
+        assert_eq!(objects.views, vec!["v_summary"]);
+        assert_eq!(objects.tables, vec!["orders", "users"]);
+        assert_eq!(
+            objects.routines,
+            vec![
+                crate::sql::Routine {
+                    name: "recalc".to_string(),
+                    kind: crate::sql::RoutineKind::Procedure,
+                },
+                crate::sql::Routine {
+                    name: "total".to_string(),
+                    kind: crate::sql::RoutineKind::Function,
+                },
+            ]
+        );
+        assert_eq!(objects.events, vec!["nightly"]);
+
+        // Views must be excluded from the table list, or the clear would issue a
+        // DROP TABLE against a view.
+        let queries: Vec<String> = runner.stdin_writes();
+        let table_query = queries
+            .iter()
+            .find(|sql| sql.contains("information_schema.TABLES"))
+            .expect("tables must be read from information_schema");
+        assert!(
+            table_query.contains("TABLE_TYPE = 'BASE TABLE'"),
+            "views must be filtered out of the table list: {table_query}"
+        );
+    }
+
+    #[test]
+    fn schema_objects_reports_an_unexpected_routine_type() {
+        // Silently skipping an unknown routine type would leave an object behind
+        // while reporting the schema as cleared.
+        let runner = FakeRunner::new();
+        runner.push_ok(""); // VIEWS
+        runner.push_ok(""); // TABLES
+        runner.push_ok("weird\tTRIGGER"); // ROUTINES
+        let inst = instance();
+        let ini_path = ini();
+        let cfg = settings();
+        let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
+        let error = client.schema_objects("appdb").unwrap_err();
+        assert!(
+            error.to_string().contains("无法确定删除语句"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn schema_objects_on_an_empty_schema_returns_empty_lists() {
+        let runner = FakeRunner::new();
+        for _ in 0..4 {
+            runner.push_ok("");
+        }
+        let inst = instance();
+        let ini_path = ini();
+        let cfg = settings();
+        let client = MysqlClient::new(&runner, &inst, &cfg, &ini_path);
+        let objects = client.schema_objects("appdb").unwrap();
+        assert!(objects.is_empty());
     }
 }

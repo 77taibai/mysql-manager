@@ -76,6 +76,13 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
+    /// 清空实例：删除所有数据库与账号，恢复为全新数据库
+    Reset {
+        name: String,
+        /// 跳过确认提示
+        #[arg(long)]
+        yes: bool,
+    },
     /// 解除绑定
     Unbind {
         name: String,
@@ -161,6 +168,14 @@ enum DbAction {
         database: String,
     },
     Remove {
+        name: String,
+        database: String,
+        /// 跳过确认提示
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 清空库内所有表与对象，但保留库名、账号与密码
+    Clear {
         name: String,
         database: String,
         /// 跳过确认提示
@@ -298,6 +313,18 @@ fn run(cli: Cli, runner: &dyn Runner) -> Result<()> {
                 }
                 println!("{}", commands::remove_database(&mut ctx, &name, &database)?)
             }
+            DbAction::Clear {
+                name,
+                database,
+                yes,
+            } => {
+                if !yes && !ui::ask_clear_confirmation(&database)? {
+                    println!("已取消。");
+                    return Ok(());
+                }
+                let outcome = commands::clear_database(&mut ctx, &name, &database)?;
+                println!("{}", commands::describe_clear(&outcome));
+            }
             DbAction::List { name } => {
                 for schema in commands::list_databases(&ctx, &name)? {
                     println!("{schema}");
@@ -319,6 +346,14 @@ fn run(cli: Cli, runner: &dyn Runner) -> Result<()> {
         Command::Unbind { name, user, host } => {
             let host = host.unwrap_or_else(|| commands::default_host().to_string());
             println!("{}", commands::unbind(&mut ctx, &name, &user, &host)?)
+        }
+        Command::Reset { name, yes } => {
+            if !yes && !ui::ask_reset_confirmation(&ctx, &name)? {
+                println!("已取消。");
+                return Ok(());
+            }
+            let outcome = commands::reset_instance(&mut ctx, &name)?;
+            println!("{}", commands::describe_reset(&outcome));
         }
         Command::Workflow { name } => {
             let name = match name {

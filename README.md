@@ -47,12 +47,42 @@ mm unbind mysql56 appuser
 mm db remove mysql56 appdb --yes
 mm user remove mysql56 appuser --yes
 
+mm db clear mysql56 appdb       # 清空库内所有表，但保留库名、账号、密码
+mm db clear mysql56 appdb --yes # 跳过确认（脚本用）
+
+mm reset mysql56          # 一键清空：删除所有数据库与账号，恢复为全新数据库
+mm reset mysql56 --yes    # 跳过确认（脚本用）
+
 mm workflow               # 交互式一键测试
 mm workflows list         # 查看全部 workflow 记录（含密码）
 mm workflows show 2       # 查看第 2 条记录
 mm workflows remove 2     # 删除记录，同时删除它的数据库与用户
 mm                        # 交互式菜单
 ```
+
+## 清空指定库（`mm db clear`）
+
+`mm db clear <name> <db>` 只清空**一个库的内容**，库本身和账号都留着。
+
+- **删除**库内全部表、视图、存储过程/函数、事件（触发器和表一起消失，无需单独列）。
+- **保留**数据库本身、数据库名、账号名、密码、授权关系，以及库的字符集与排序规则。
+- 因此 `mm workflow` 打印出来的那套连接信息在清空后**照旧可用**，可以直接复用同一个账号反复跑测试。
+- 外键不会挡住清空：脚本先关闭 `FOREIGN_KEY_CHECKS`、按 视图→表→存储对象→事件 的顺序删除，最后恢复。
+- 执行后会重新读取库内对象，确认真的空了才报告成功；有残留就报错，不会谎报。
+- 需要实例在运行；拒绝清空系统库；库不存在时在发出任何 DDL 之前就报错。
+
+和 `mm reset` 的区别：`clear` 是「库还在，内容清空」，`reset` 是「库和账号一起删掉，回到刚装好的状态」。
+
+## 清空实例（`mm reset`）
+
+`mm reset <name>` 把实例恢复到刚安装完的状态：删除**所有**用户创建的数据库和账号。
+
+- **保留**服务端自带的 `mysql`、`information_schema`、`performance_schema`、`sys` 四个系统库，以及 `root`、`mysql.sys`、`mysql.session`、`mysql.infoschema` 这些系统账号（`mysql.` 前缀一律保留）。删掉它们会让实例直接不可用，那不叫重置。
+- 账号先于数据库删除：账号持有库上的授权，先删库会留下悬空授权。
+- 同时清除 `config.toml` 中该实例的绑定记录与 workflow 记录——它们指向的对象已经不存在了，留着只会让配置说谎。
+- 需要实例处于运行状态（与其它库/用户命令一致），未运行时提示先 `mm start`。
+- 交互确认要求**重新输入实例名**，而不是敲一个 `y`；`--yes` 可跳过。
+- 结果会列出删除了哪些库/账号、保留了哪些，不会静默成功。
 
 `mm workflow` 会选一个实例、必要时启动它、随机生成数据库/用户/密码、完成绑定、验证新账号确实能连上，然后打印连接信息并写入 `config.toml`。
 
@@ -65,7 +95,7 @@ mm                        # 交互式菜单
 - **密码不进命令行。** SQL 通过实例自带的 `mysql.exe` 执行，root 密码走临时 `--defaults-file`（用完即删），DDL 脚本经标准输入传入。
 - **按版本生成 SQL。** `CREATE USER IF NOT EXISTS` 与 `utf8mb4` 只在服务端支持时使用（5.7.6+ / 5.5.3+）；MySQL 8 的账号使用 `mysql_native_password` 以兼容旧客户端。
 - **同一时间只运行一个实例。** 启动前会检查其它已登记实例是否在运行，若有则拒绝并提示先停止哪个。这样端口永远不会被两个 `mysqld` 重复占用。判定依据是实际连通性而非端口号比较，因此即使你改过 `my.ini` 的端口也依然可靠。
-- **受保护对象。** `mysql`、`information_schema`、`performance_schema`、`sys` 这些系统库以及 `root` 账号，都不能被删除或绑定。
+- **受保护对象。** `mysql`、`information_schema`、`performance_schema`、`sys` 这些系统库以及 `root` 账号，都不能被删除或绑定。`mm reset` 清空时同样跳过它们。
 
 ## 关于 PowerShell 的提示
 

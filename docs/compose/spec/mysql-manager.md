@@ -61,9 +61,11 @@ mm user remove <name> <user>
 mm user list <name>
 mm db add <name> <db>                  # 创建数据库
 mm db remove <name> <db>
+mm db clear <name> <db> [--yes]         # 清空库内对象，保留库名与账号密码
 mm db list <name>
 mm bind <name> <db> <user>             # 一对一独占绑定
 mm unbind <name> <user>                # 解除绑定
+mm reset <name> [--yes]                # 一键清空实例：删除所有数据库与账号
 mm workflow                            # 一键测试工作流
 mm login <name>                        # 设置/更新 root 密码
 ```
@@ -181,13 +183,43 @@ password = "Xk9#mQ2p"
 
 **查看与删除**：`mm workflows list` 列出全部记录（含密码、时间、实例、库、用户）；`mm workflows show <序号>` 查看单条完整信息；`mm workflows remove <序号>` 先删用户再删库（顺序不可颠倒，否则会留下指向已删库的授权），然后移除记录。两条 DROP 都容忍对象已不存在。`DROP USER IF EXISTS` 需 5.7.8+，更低版本改为先查 `mysql.user` 再决定是否执行 `DROP USER`。
 
-### [S2.9] 错误处理与退出码
+### [S2.9] 清空指定库
+
+`mm db clear <name> <db>` 清空**一个库的内容**，库本身与账号保持不动。用途是反复复用同一套连接信息跑测试：`mm workflow` 打印出来的库名/用户名/密码在清空后仍然有效。
+
+**删除范围**：`information_schema` 中该库的视图（`VIEWS`）、基表（`TABLES` 且 `TABLE_TYPE='BASE TABLE'`）、存储过程与函数（`ROUTINES`）、事件（`EVENTS`）。触发器不单独列出——它随所属表一起消失，单独 `DROP TRIGGER` 只会在表已删后失败。
+
+**明确不删**：数据库本身、库名、字符集与排序规则、账号、密码、授权。因此实现上**不是** `db remove` + `db add`：重建库会改变字符集默认值，且库的身份变了，任何依赖库名的外部配置都会受影响。
+
+**顺序与外键**：脚本首行 `SET FOREIGN_KEY_CHECKS = 0`，末尾恢复为 1；删除顺序为 视图 → 表 → 存储对象 → 事件。视图可能依赖表，所以视图在前；关闭外键检查使父子表无需按依赖顺序排列。
+
+**对象名转义**：库内对象名来自 `information_schema`，不是用户输入，可能含空格、点号甚至反引号，因此不能套用 `validate_identifier`。改为按标识符引用规则转义（反引号翻倍），含 NUL 字节的直接拒绝。库名仍走严格校验（它来自用户输入）。
+
+**结果校验**：执行后重新枚举该库对象，必须为空才算成功，否则报错并列出残留——避免「部分失败但报告成功」。库不存在时在发出任何 DDL 之前就拒绝。
+
+### [S2.10] 一键清空实例
+
+`mm reset <name>` 把实例恢复到刚初始化完的状态，用于「反复测试前先清干净」。
+
+**删除范围**：`SHOW DATABASES` 得到的全部库中，除系统库（`mysql`、`information_schema`、`performance_schema`、`sys`）之外全部 `DROP DATABASE IF EXISTS`；`mysql.user` 得到的全部账号中，除 `root`、`mysql.sys`、`mysql.session`、`mysql.infoschema` 以及 `mysql.` 前缀之外全部 `DROP USER`。
+
+**保留的理由**：删掉系统库或系统账号会让实例直接不可用——那不是重置而是破坏。因此这些对象不是「被静默忽略」，而是在结果里显式列为「保留」。
+
+**顺序**：先删账号再删库。账号持有库上的授权，先删库会留下悬空授权记录。
+
+**账号读取**：用 `SELECT User, Host FROM mysql.user` 两列，按 `--batch` 的制表符分隔解析，而不是把 `User@Host` 拼成一个字符串再切分——host 本身可能含 `@` 之外的任意内容，拼起来再拆不可靠。
+
+**配置同步**：清空后 `config.toml` 中该实例的 `[[bindings]]` 与 `workflows` 记录一并删除，否则配置会指向已不存在的对象。
+
+**前置条件与确认**：要求实例处于运行状态（与其它库/用户命令一致）。交互确认要求重新输入实例名而非单个 `y`，`--yes` 跳过。执行后输出删除的库/账号清单与保留清单，不静默成功。
+
+### [S2.11] 错误处理与退出码
 
 - `0` 成功；`1` 一般错误；`2` 参数/用法错误；`3` 实例未登记或路径无效；`4` MySQL 未就绪或连接失败
 - 所有面向用户的错误写到 stderr，正常结果写 stdout
 - 不在错误信息中回显密码；`--defaults-file` 临时文件即使出错也通过 RAII guard 删除
 
-### [S2.10] 测试边界
+### [S2.12] 测试边界
 
 - `my.ini` 解析、随机名生成、标识符校验、版本号解析、配置文件读写：纯函数，单元测试覆盖，不依赖真实 MySQL
 - 进程启停与 SQL 执行：通过 trait 抽象成可替换的 executor，单元测试用 fake 实现验证命令构造与错误传播
@@ -214,3 +246,5 @@ password = "Xk9#mQ2p"
 - [x] T5: 实现 user/db 增删与 `bind` 一对一独占绑定 — acceptance: 在本机 5.6.51 上建库建用户后绑定，`SHOW GRANTS` 仅含该库权限；`bind` 到第二个库被拒绝；系统库与 root 的删除被拒 (covers: S2.6, S2.7)
 - [x] T6: 实现无参数交互式菜单与 `mm workflow` 一键工作流 — acceptance: `mm workflow` 完成选实例→启动→随机建库建用户→绑定→新账号连通验证→打印并落盘；配置文件中出现 `[workflow]` 段 (covers: S2.8)
 - [x] T7: 补齐错误码一致性、密码不回显、临时文件清理，并跑通 `cargo test` / `cargo clippy` / `cargo build --release` — acceptance: 三条命令均无 error；clippy 无 warning (covers: S2.9, S2.10)
+- [x] T8: 实现 `mm reset` 一键清空实例（删库、删账号、同步清理配置记录） — acceptance: 对本机 5.6.51 执行后仅剩系统库与系统账号，`db list` / `user list` 只剩系统项；结果输出列出删除与保留清单；单元测试验证系统库/系统账号不被删除、账号先于库删除、配置记录被清理 (covers: S2.10)
+- [x] T9: 实现 `mm db clear` 清空指定库内容（保留库名、账号与密码） — acceptance: 对本机 5.6.51 上 workflow 生成的库执行后，表/视图/存储过程/函数/事件全部消失，`information_schema.SCHEMATA` 中该库仍在且字符集不变，`SHOW GRANTS` 前后完全一致，用**原密码**仍可连接并建表；含外键的库也能清空；系统库与不存在的库被拒；单元测试验证视图先于表删除、对象名反引号被转义、残留对象被报告为失败 (covers: S2.9)

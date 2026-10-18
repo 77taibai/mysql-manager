@@ -437,6 +437,317 @@ pub fn list_databases(ctx: &Ctx<'_>, instance_name: &str) -> Result<Vec<String>>
     Ok(schemas)
 }
 
+/// What a wipe removed, so the caller can report it and the tests can assert on
+/// it without parsing prose.
+#[derive(Debug)]
+pub struct ResetOutcome {
+    pub instance: String,
+    pub dropped_schemas: Vec<String>,
+    pub dropped_accounts: Vec<String>,
+    pub kept_schemas: Vec<String>,
+    pub kept_accounts: Vec<String>,
+    pub cleared_bindings: usize,
+    pub cleared_workflows: usize,
+}
+
+/// Wipes an instance back to a freshly initialised state: every user-created
+/// schema and account is dropped, while the server's own schemas (`mysql`,
+/// `information_schema`, `performance_schema`, `sys`) and the accounts it ships
+/// with are kept. Dropping those would break the instance instead of resetting
+/// it, so they are reported as kept rather than silently ignored.
+///
+/// Accounts go before schemas: an account holds grants on schemas, and dropping
+/// the schema first would leave those grants dangling.
+pub fn reset_instance(ctx: &mut Ctx<'_>, instance_name: &str) -> Result<ResetOutcome> {
+    let instance = ctx.config.require(instance_name)?.clone();
+    ensure_running(ctx, &instance)?;
+    let (settings, ini_path) = ctx.settings_for(&instance)?;
+    let client = ctx.client(&instance, &settings, &ini_path);
+
+    let schemas = client.existing_schemas().map_err(|error| {
+        AppError::mysql(format!("无法列出 `{instance_name}` 上的数据库：{error}"))
+    })?;
+    let accounts = client.existing_account_pairs().map_err(|error| {
+        AppError::mysql(format!("无法列出 `{instance_name}` 上的账号：{error}"))
+    })?;
+
+    let kept_schemas: Vec<String> = schemas
+        .iter()
+        .filter(|name| sql::is_protected_schema(name))
+        .cloned()
+        .collect();
+    let kept_accounts: Vec<String> = accounts
+        .iter()
+        .filter(|(user, _)| sql::is_reserved_account(user))
+        .map(|(user, host)| sql::describe_account(user, host))
+        .collect();
+
+    // Drop accounts first, then the schemas they were granted on.
+    let account_plan = sql::drop_user_accounts_sql(&accounts)?;
+    client.run_sql(&account_plan.statements)?;
+    let schema_plan = sql::drop_user_schemas_sql(&schemas)?;
+    client.run_sql(&schema_plan.statements)?;
+
+    let dropped_accounts: Vec<String> = accounts
+        .iter()
+        .filter(|(user, _)| !sql::is_reserved_account(user))
+        .map(|(user, host)| sql::describe_account(user, host))
+        .collect();
+    let dropped_schemas: Vec<String> = schemas
+        .iter()
+        .filter(|name| !sql::is_protected_schema(name))
+        .cloned()
+        .collect();
+
+    // The bindings and workflow records now point at objects that no longer
+    // exist, so keeping them would make the configuration lie about the server.
+    let bindings_before = ctx.config.bindings.len();
+    ctx.config
+        .bindings
+        .retain(|item| item.instance != instance_name);
+    let workflows_before = ctx.config.workflows.len();
+    ctx.config
+        .workflows
+        .retain(|item| item.instance != instance_name);
+    ctx.save()?;
+
+    Ok(ResetOutcome {
+        instance: instance_name.to_string(),
+        dropped_schemas,
+        dropped_accounts,
+        kept_schemas,
+        kept_accounts,
+        cleared_bindings: bindings_before - ctx.config.bindings.len(),
+        cleared_workflows: workflows_before - ctx.config.workflows.len(),
+    })
+}
+
+/// Renders a wipe outcome as the multi-line report printed by both entry points.
+pub fn describe_reset(outcome: &ResetOutcome) -> String {
+    let mut lines = vec![format!(
+        "已清空 `{}`：数据库与账号均已恢复到全新状态",
+        outcome.instance
+    )];
+    lines.push(format!(
+        "  删除数据库 {} 个：{}",
+        outcome.dropped_schemas.len(),
+        if outcome.dropped_schemas.is_empty() {
+            "（无）".to_string()
+        } else {
+            outcome.dropped_schemas.join("、")
+        }
+    ));
+    lines.push(format!(
+        "  删除账号 {} 个：{}",
+        outcome.dropped_accounts.len(),
+        if outcome.dropped_accounts.is_empty() {
+            "（无）".to_string()
+        } else {
+            outcome.dropped_accounts.join("、")
+        }
+    ));
+    lines.push(format!(
+        "  保留系统数据库：{}",
+        if outcome.kept_schemas.is_empty() {
+            "（无）".to_string()
+        } else {
+            outcome.kept_schemas.join("、")
+        }
+    ));
+    lines.push(format!(
+        "  保留系统账号：{}",
+        if outcome.kept_accounts.is_empty() {
+            "（无）".to_string()
+        } else {
+            outcome.kept_accounts.join("、")
+        }
+    ));
+    if outcome.cleared_bindings > 0 || outcome.cleared_workflows > 0 {
+        lines.push(format!(
+            "  同时清除了 {} 条绑定记录、{} 条 workflow 记录",
+            outcome.cleared_bindings, outcome.cleared_workflows
+        ));
+    }
+    lines.join("\n")
+}
+
+/// What a "clear the contents" run removed.
+#[derive(Debug)]
+pub struct ClearOutcome {
+    pub instance: String,
+    pub database: String,
+    pub dropped_views: Vec<String>,
+    pub dropped_tables: Vec<String>,
+    pub dropped_routines: Vec<String>,
+    pub dropped_events: Vec<String>,
+    /// Accounts that still hold privileges on the schema, re-read after the
+    /// clear to prove the connection information was left alone.
+    pub surviving_accounts: Vec<String>,
+}
+
+impl ClearOutcome {
+    pub fn dropped_count(&self) -> usize {
+        self.dropped_views.len()
+            + self.dropped_tables.len()
+            + self.dropped_routines.len()
+            + self.dropped_events.len()
+    }
+}
+
+/// Empties one schema without touching the schema itself, its accounts or their
+/// privileges.
+///
+/// This is deliberately *not* `db remove` followed by `db add`: dropping and
+/// recreating the schema would revoke nothing on its own but would silently
+/// change the default charset/collation, and any tooling that keyed off the
+/// schema's identity would see a new database. Keeping the schema in place is
+/// what makes the database name, the account name and the password keep
+/// working — exactly the credentials a workflow printed.
+pub fn clear_database(
+    ctx: &mut Ctx<'_>,
+    instance_name: &str,
+    database: &str,
+) -> Result<ClearOutcome> {
+    sql::validate_schema_name(database)?;
+    if sql::is_protected_schema(database) {
+        return Err(AppError::usage(format!("拒绝清空系统数据库 `{database}`")));
+    }
+    let instance = ctx.config.require(instance_name)?.clone();
+    ensure_running(ctx, &instance)?;
+    let (settings, ini_path) = ctx.settings_for(&instance)?;
+    let client = ctx.client(&instance, &settings, &ini_path);
+
+    let existing = client.existing_schemas()?;
+    if !existing.iter().any(|item| item == database) {
+        return Err(AppError::usage(format!(
+            "`{instance_name}` 上不存在数据库 `{database}`；可用 `mm db list {instance_name}` 查看"
+        )));
+    }
+
+    let objects = client.schema_objects(database)?;
+    let plan = sql::clear_schema_sql(database, &objects)?;
+    client.run_sql(&plan.statements)?;
+
+    // Verify rather than assume: report a clear only when a fresh listing really
+    // is empty. A partially failed script must not be described as success.
+    let after = client.schema_objects(database)?;
+    if !after.is_empty() {
+        return Err(AppError::mysql(format!(
+            "清空后 `{database}` 中仍有残留对象：{}",
+            describe_objects(&after)
+        )));
+    }
+
+    // The schema must still be there, and so must the privileges of any account
+    // the tool knows is bound to it.
+    let still_present = client
+        .existing_schemas()?
+        .iter()
+        .any(|item| item == database);
+    if !still_present {
+        return Err(AppError::mysql(format!(
+            "清空后数据库 `{database}` 不存在了；这本不该发生"
+        )));
+    }
+
+    let mut surviving_accounts = Vec::new();
+    let bound: Vec<String> = ctx
+        .config
+        .bindings
+        .iter()
+        .filter(|item| item.instance == instance_name && item.database == database)
+        .map(|item| item.user.clone())
+        .collect();
+    for user in bound {
+        let host = default_host().to_string();
+        if let Ok(grants) = client.show_grants(&user, &host) {
+            let keeps_schema = grants
+                .iter()
+                .any(|line| sql::schema_from_grant_line(line).as_deref() == Some(database));
+            if keeps_schema {
+                surviving_accounts.push(format!("{user}@{host}"));
+            }
+        }
+    }
+
+    Ok(ClearOutcome {
+        instance: instance_name.to_string(),
+        database: database.to_string(),
+        dropped_views: objects.views,
+        dropped_tables: objects.tables,
+        dropped_routines: objects
+            .routines
+            .iter()
+            .map(|item| format!("{}({})", item.name, item.kind.keyword()))
+            .collect(),
+        dropped_events: objects.events,
+        surviving_accounts,
+    })
+}
+
+fn describe_objects(objects: &sql::SchemaObjects) -> String {
+    let mut parts = Vec::new();
+    if !objects.views.is_empty() {
+        parts.push(format!("视图 {}", objects.views.join("、")));
+    }
+    if !objects.tables.is_empty() {
+        parts.push(format!("表 {}", objects.tables.join("、")));
+    }
+    if !objects.routines.is_empty() {
+        parts.push(format!(
+            "存储对象 {}",
+            objects
+                .routines
+                .iter()
+                .map(|item| item.name.clone())
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    if !objects.events.is_empty() {
+        parts.push(format!("事件 {}", objects.events.join("、")));
+    }
+    parts.join("；")
+}
+
+/// Renders a clear result, naming what was removed and confirming that the
+/// connection information is untouched.
+pub fn describe_clear(outcome: &ClearOutcome) -> String {
+    let mut lines = vec![format!(
+        "已清空 `{}` 上 `{}` 的全部内容（数据库本身与账号权限未改动）",
+        outcome.instance, outcome.database
+    )];
+    if outcome.dropped_count() == 0 {
+        lines.push("  该数据库原本就是空的，未执行任何删除。".to_string());
+    } else {
+        for (label, items) in [
+            ("删除表", &outcome.dropped_tables),
+            ("删除视图", &outcome.dropped_views),
+            ("删除存储对象", &outcome.dropped_routines),
+            ("删除事件", &outcome.dropped_events),
+        ] {
+            if !items.is_empty() {
+                lines.push(format!(
+                    "  {label} {} 个：{}",
+                    items.len(),
+                    items.join("、")
+                ));
+            }
+        }
+    }
+    lines.push(format!("  数据库名保留：{}", outcome.database));
+    if outcome.surviving_accounts.is_empty() {
+        lines.push("  账号与密码：本工具未改动任何账号或授权".to_string());
+    } else {
+        lines.push(format!(
+            "  账号与密码：以下账号仍保有 `{}` 的授权，连接信息不变：{}",
+            outcome.database,
+            outcome.surviving_accounts.join("、")
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Binds a user to exactly one database: grant on that schema, revoke
 /// everything else, then report the privileges that actually took effect.
 pub fn bind(
@@ -1171,5 +1482,341 @@ mod tests {
         assert!(message.contains("绑定记录"));
         assert!(ctx.config.instances.is_empty());
         assert!(ctx.config.bindings.is_empty());
+    }
+
+    /// Builds a context with one running instance whose `my.ini` exists, so a
+    /// wipe can reach the SQL layer with the fake runner answering the listing
+    /// queries.
+    fn running_ctx<'a>(runner: &'a dyn crate::process::Runner, dir: &std::path::Path) -> Ctx<'a> {
+        let ini = dir.join("reset.ini");
+        std::fs::write(
+            &ini,
+            format!("[mysqld]\ndatadir={}\nport=3306\n", dir.display()),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.instances.push(Instance {
+            name: "wipe".to_string(),
+            home: dir.display().to_string(),
+            my_ini: Some(ini.display().to_string()),
+            root_password: "pw".to_string(),
+            last_pid: None,
+        });
+        Ctx::new(config, runner)
+    }
+
+    #[test]
+    fn a_wipe_drops_user_objects_and_forgets_stale_records() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-reset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        runner.push_ok("mysqld is alive"); // ensure_running
+        runner.push_ok("mysql\nsys\nappdb\nother_db"); // SHOW DATABASES
+        runner.push_ok("root\tlocalhost\napp\tlocalhost"); // SELECT User, Host
+        runner.push_ok(""); // DROP USER script
+        runner.push_ok(""); // DROP DATABASE script
+        let mut ctx = running_ctx(&runner, &dir);
+        ctx.config.bindings.push(Binding {
+            instance: "wipe".to_string(),
+            database: "appdb".to_string(),
+            user: "app".to_string(),
+        });
+        ctx.config.workflows.push(WorkflowRecord {
+            instance: "wipe".to_string(),
+            database: "appdb".to_string(),
+            username: "app".to_string(),
+            ..WorkflowRecord::default()
+        });
+
+        let outcome = reset_instance(&mut ctx, "wipe").unwrap();
+        assert_eq!(outcome.dropped_schemas, vec!["appdb", "other_db"]);
+        assert_eq!(outcome.dropped_accounts, vec!["app@localhost"]);
+        assert_eq!(outcome.kept_schemas, vec!["mysql", "sys"]);
+        assert_eq!(outcome.kept_accounts, vec!["root@localhost"]);
+        assert_eq!(outcome.cleared_bindings, 1);
+        assert_eq!(outcome.cleared_workflows, 1);
+        assert!(ctx.config.bindings.is_empty());
+        assert!(ctx.config.workflows.is_empty());
+
+        // Accounts must be dropped before the schemas they hold grants on.
+        let scripts = runner.stdin_writes();
+        let account_script = scripts
+            .iter()
+            .position(|text| text.contains("DROP USER"))
+            .expect("a wipe must drop accounts");
+        let schema_script = scripts
+            .iter()
+            .position(|text| text.contains("DROP DATABASE"))
+            .expect("a wipe must drop schemas");
+        assert!(
+            account_script < schema_script,
+            "accounts must be dropped first: {scripts:?}"
+        );
+        assert!(scripts[account_script].contains("'app'@'localhost'"));
+        assert!(!scripts[account_script].contains("'root'@'localhost'"));
+        assert!(scripts[schema_script].contains("`appdb`"));
+        assert!(!scripts[schema_script].contains("`mysql`"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_wipe_on_a_pristine_instance_issues_no_destructive_sql() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-reset2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        runner.push_ok("mysqld is alive"); // ensure_running
+        runner.push_ok("mysql\ninformation_schema\nperformance_schema\nsys");
+        runner.push_ok("root\tlocalhost");
+        let mut ctx = running_ctx(&runner, &dir);
+
+        let outcome = reset_instance(&mut ctx, "wipe").unwrap();
+        assert!(outcome.dropped_schemas.is_empty());
+        assert!(outcome.dropped_accounts.is_empty());
+        assert_eq!(outcome.kept_schemas.len(), 4);
+        // `run_sql` short-circuits an empty plan, so the only scripts sent are
+        // the two listing queries: no DROP may reach the server.
+        for script in runner.stdin_writes() {
+            assert!(
+                !script.contains("DROP"),
+                "unexpected destructive SQL: {script}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_wipe_requires_the_instance_to_be_running() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-reset3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        runner.push_fail(1, "unreachable"); // ensure_running
+        let mut ctx = running_ctx(&runner, &dir);
+        let error = reset_instance(&mut ctx, "wipe").unwrap_err();
+        assert!(error.to_string().contains("未在运行"), "got: {error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_wipe_refuses_an_unregistered_instance() {
+        let runner = crate::process::SystemRunner;
+        let mut ctx = Ctx::new(Config::default(), &runner);
+        let error = reset_instance(&mut ctx, "ghost").unwrap_err();
+        assert!(error.to_string().contains("未登记"));
+    }
+
+    #[test]
+    fn the_wipe_report_names_what_was_dropped_and_kept() {
+        let outcome = ResetOutcome {
+            instance: "wipe".to_string(),
+            dropped_schemas: vec!["appdb".to_string()],
+            dropped_accounts: vec!["app@localhost".to_string()],
+            kept_schemas: vec!["mysql".to_string()],
+            kept_accounts: vec!["root@localhost".to_string()],
+            cleared_bindings: 1,
+            cleared_workflows: 2,
+        };
+        let text = describe_reset(&outcome);
+        assert!(text.contains("wipe"));
+        assert!(text.contains("appdb"));
+        assert!(text.contains("app@localhost"));
+        assert!(text.contains("mysql"));
+        assert!(text.contains("root@localhost"));
+        assert!(text.contains("1 条绑定记录"));
+        assert!(text.contains("2 条 workflow 记录"));
+    }
+
+    #[test]
+    fn the_wipe_report_says_none_when_nothing_was_dropped() {
+        let outcome = ResetOutcome {
+            instance: "wipe".to_string(),
+            dropped_schemas: Vec::new(),
+            dropped_accounts: Vec::new(),
+            kept_schemas: vec!["mysql".to_string()],
+            kept_accounts: vec!["root@localhost".to_string()],
+            cleared_bindings: 0,
+            cleared_workflows: 0,
+        };
+        let text = describe_reset(&outcome);
+        assert!(text.contains("删除数据库 0 个：（无）"));
+        // No stale-record line when nothing was cleared.
+        assert!(!text.contains("同时清除了"));
+    }
+
+    /// Queues the four catalog queries a clear issues, in the order the client
+    /// runs them.
+    fn push_schema_listing(
+        runner: &crate::process::testing::FakeRunner,
+        views: &str,
+        tables: &str,
+        routines: &str,
+        events: &str,
+    ) {
+        runner.push_ok(views);
+        runner.push_ok(tables);
+        runner.push_ok(routines);
+        runner.push_ok(events);
+    }
+
+    #[test]
+    fn clearing_a_database_drops_its_objects_but_not_the_database() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        runner.push_ok("mysqld is alive"); // ensure_running
+        runner.push_ok("mysql\nappdb"); // SHOW DATABASES
+        push_schema_listing(&runner, "v_summary", "orders\nusers", "", "nightly");
+        runner.push_ok(""); // the clear script
+        push_schema_listing(&runner, "", "", "", ""); // verification
+        runner.push_ok("mysql\nappdb"); // schema still present
+        runner.push_ok(
+            "GRANT USAGE ON *.* TO 'app'@'localhost'\n\
+             GRANT ALL PRIVILEGES ON `appdb`.* TO 'app'@'localhost'", // SHOW GRANTS
+        );
+        let mut ctx = running_ctx(&runner, &dir);
+        ctx.config.bindings.push(Binding {
+            instance: "wipe".to_string(),
+            database: "appdb".to_string(),
+            user: "app".to_string(),
+        });
+
+        let outcome = clear_database(&mut ctx, "wipe", "appdb").unwrap();
+        assert_eq!(outcome.database, "appdb");
+        assert_eq!(outcome.dropped_tables, vec!["orders", "users"]);
+        assert_eq!(outcome.dropped_views, vec!["v_summary"]);
+        assert_eq!(outcome.dropped_events, vec!["nightly"]);
+        assert_eq!(outcome.dropped_count(), 4);
+        // The account still holds its grant on the schema: that is the whole
+        // point of clearing instead of dropping.
+        assert_eq!(outcome.surviving_accounts, vec!["app@localhost"]);
+
+        let scripts = runner.stdin_writes();
+        let clear_script = scripts
+            .iter()
+            .find(|sql| sql.contains("DROP TABLE"))
+            .expect("a clear must drop tables");
+        assert!(!clear_script.contains("DROP DATABASE"));
+        assert!(!clear_script.contains("DROP USER"));
+        // The binding must survive: the schema and the account both still exist.
+        assert_eq!(ctx.config.bindings.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_an_empty_database_sends_no_destructive_sql() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-clear2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        runner.push_ok("mysqld is alive"); // ensure_running
+        runner.push_ok("mysql\nappdb"); // SHOW DATABASES
+        push_schema_listing(&runner, "", "", "", ""); // nothing to drop
+        push_schema_listing(&runner, "", "", "", ""); // verification
+        runner.push_ok("mysql\nappdb"); // schema still present
+        let mut ctx = running_ctx(&runner, &dir);
+
+        let outcome = clear_database(&mut ctx, "wipe", "appdb").unwrap();
+        assert_eq!(outcome.dropped_count(), 0);
+        for script in runner.stdin_writes() {
+            assert!(
+                !script.contains("DROP"),
+                "unexpected destructive SQL: {script}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_a_missing_database_is_refused_before_any_ddl() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-clear3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        runner.push_ok("mysqld is alive"); // ensure_running
+        runner.push_ok("mysql\nother"); // SHOW DATABASES: appdb absent
+        let mut ctx = running_ctx(&runner, &dir);
+
+        let error = clear_database(&mut ctx, "wipe", "appdb").unwrap_err();
+        assert!(error.to_string().contains("不存在数据库"), "got: {error}");
+        for script in runner.stdin_writes() {
+            assert!(!script.contains("DROP"), "no DDL may run: {script}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_a_system_database_is_refused() {
+        let runner = crate::process::SystemRunner;
+        let mut config = Config::default();
+        config.instances.push(Instance {
+            name: "x".to_string(),
+            home: "C:/x".to_string(),
+            my_ini: None,
+            root_password: String::new(),
+            last_pid: None,
+        });
+        let mut ctx = Ctx::new(config, &runner);
+        let error = clear_database(&mut ctx, "x", "mysql").unwrap_err();
+        assert!(error.to_string().contains("系统数据库"));
+        assert_eq!(error.code(), crate::error::EXIT_USAGE);
+    }
+
+    #[test]
+    fn a_clear_that_leaves_objects_behind_is_reported_as_a_failure() {
+        use crate::process::testing::FakeRunner;
+        let dir = std::env::temp_dir().join(format!("mm-clear4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = FakeRunner::new();
+        runner.push_ok("mysqld is alive"); // ensure_running
+        runner.push_ok("mysql\nappdb"); // SHOW DATABASES
+        push_schema_listing(&runner, "", "orders", "", ""); // before
+        runner.push_ok(""); // clear script
+        push_schema_listing(&runner, "", "orders", "", ""); // still there
+        let mut ctx = running_ctx(&runner, &dir);
+
+        let error = clear_database(&mut ctx, "wipe", "appdb").unwrap_err();
+        assert!(error.to_string().contains("仍有残留对象"), "got: {error}");
+        assert!(error.to_string().contains("orders"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_clear_report_confirms_the_connection_information_is_unchanged() {
+        let outcome = ClearOutcome {
+            instance: "wipe".to_string(),
+            database: "appdb".to_string(),
+            dropped_views: vec!["v".to_string()],
+            dropped_tables: vec!["t1".to_string(), "t2".to_string()],
+            dropped_routines: vec!["p(PROCEDURE)".to_string()],
+            dropped_events: Vec::new(),
+            surviving_accounts: vec!["app@localhost".to_string()],
+        };
+        let text = describe_clear(&outcome);
+        assert!(text.contains("appdb"));
+        assert!(text.contains("删除表 2 个"));
+        assert!(text.contains("删除视图 1 个"));
+        assert!(text.contains("删除存储对象 1 个"));
+        assert!(text.contains("数据库名保留：appdb"));
+        assert!(text.contains("连接信息不变"));
+        assert!(text.contains("app@localhost"));
+    }
+
+    #[test]
+    fn the_clear_report_says_so_when_the_database_was_already_empty() {
+        let outcome = ClearOutcome {
+            instance: "wipe".to_string(),
+            database: "appdb".to_string(),
+            dropped_views: Vec::new(),
+            dropped_tables: Vec::new(),
+            dropped_routines: Vec::new(),
+            dropped_events: Vec::new(),
+            surviving_accounts: Vec::new(),
+        };
+        let text = describe_clear(&outcome);
+        assert!(text.contains("原本就是空的"));
+        assert!(text.contains("未改动任何账号或授权"));
     }
 }
